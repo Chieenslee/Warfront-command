@@ -6,6 +6,14 @@ from pathlib import Path
 
 import pygame
 
+import math
+import random
+import sys
+import json
+from pathlib import Path
+
+import pygame
+
 from warfront.assets.loader import get_assets
 from warfront.assets.registry import ASSET_DIR
 from warfront.config import CAPTURE_SECONDS, FPS, SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
@@ -17,11 +25,12 @@ from warfront.entities.support import EnemyAircraft, MortarShell
 from warfront.entities.vehicles import TankVehicle
 from warfront.systems.balance import UNIT_STATS
 from warfront.systems.campaign import CHAPTERS_BY_MAP, SHOP_ITEMS, CampaignState
-from warfront.systems.combat_effects import CombatEffects
+from warfront.systems.combat_effects import CombatEffectEvent, CombatEffects
 from warfront.systems.inventory import Inventory
 from warfront.systems.modes import OFFLINE_CONFIG, ModeConfig
 from warfront.systems.particles import ParticleSystem
 from warfront.systems.weapons import WEAPONS, weapon_name
+from warfront.entities.projectile import Bullet
 from warfront.world import astar, bfs_nearest, dfs_reachable, grid_from_tilemap
 from warfront.world.map_data import DEFAULT_MAP_ID, MAPS
 from warfront.world.tilemap import TileMap
@@ -241,7 +250,8 @@ class Game:
         self.floaters: list[tuple[str, pygame.Vector2, tuple[int, int, int], float]] = []
         self.mortar_cooldown = 0.0
         self.particles = ParticleSystem()
-        self.effects = CombatEffects(self.particles)
+        self.sync_events = []
+        self.effects = CombatEffects(self.particles, self.sync_events)
         self.corpses: list[tuple[pygame.Surface, pygame.Rect, float]] = []
         armor_bonus = self.campaign.purchases.get("armor", 0) * 20
         self.player.max_hp += armor_bonus
@@ -979,12 +989,6 @@ class Game:
     def weapon_cooldown_scale(self) -> float:
         return max(0.62, 1.0 - self.campaign.purchases.get("reload_drill", 0) * 0.07)
 
-    def handle_title_click(self, pos: tuple[int, int]) -> None:
-        for rect, action in self.title_buttons:
-            if rect.collidepoint(pos):
-                self.run_title_action(action)
-                return
-
     def handle_lobby_click(self, pos: tuple[int, int]) -> None:
         for rect, action in self.lobby_buttons:
             if rect.collidepoint(pos):
@@ -1635,10 +1639,25 @@ class Game:
             "enemy_aircraft": [serialize_aircraft(a) for a in self.enemy_aircraft],
             "items": [serialize_item(item) for item in self.items],
             "bullets": [
-                {"x": b.pos.x, "y": b.pos.y, "rot": math.degrees(math.atan2(b.direction.y, b.direction.x))}
+                {
+                    "x": b.pos.x, 
+                    "y": b.pos.y, 
+                    "dx": b.direction.x, 
+                    "dy": b.direction.y,
+                    "f": getattr(b, "friendly", True),
+                    "w": getattr(b, "weapon", "rifle")
+                }
                 for b in self.bullets
                 if hasattr(b, "direction")
             ],
+            "floaters": [
+                {"t": t, "x": p.x, "y": p.y, "c": c, "l": l}
+                for t, p, c, l in self.floaters
+            ],
+            "events": [
+                {"k": e.kind, "x": e.pos[0], "y": e.pos[1], "w": e.weapon, "d": e.direction, "s": e.scale}
+                for e in self.sync_events
+            ] if hasattr(self, "sync_events") else [],
             "client_mapping": client_mapping,
             "vehicle_mapping": vehicle_mapping,
             "host_inventory": self._inventory_to_dict(self.inventory),
@@ -1652,6 +1671,8 @@ class Game:
             "boss_index": boss_index,
         }
         self.network_server.broadcast_state(state)
+        if hasattr(self, "sync_events"):
+            self.sync_events.clear()
 
     def _sync_client(self, dt: float) -> bool:
         if not getattr(self, "network_client", None) or not self.network_client.connected:
@@ -1765,62 +1786,6 @@ class Game:
                     tank.shooting_flash = record.get("shooting_flash", 0.0)
                     tank.anim_time = record.get("anim_time", tank.anim_time)
                     tank.occupied = bool(record.get("owner_id"))
-
-            if "enemy_vehicles" in state:
-                sync_tanks(self.enemy_vehicles, state["enemy_vehicles"], "enemy")
-                boss_index = state.get("boss_index", -1)
-                self.boss_vehicle = self.enemy_vehicles[boss_index] if 0 <= boss_index < len(self.enemy_vehicles) else None
-
-            if "vehicles" in state:
-                sync_tanks(self.vehicles, state["vehicles"], "ally")
-
-            if "enemy_aircraft" in state:
-                srv_planes = state["enemy_aircraft"]
-                while len(self.enemy_aircraft) < len(srv_planes):
-                    record = srv_planes[len(self.enemy_aircraft)]
-                    self.enemy_aircraft.append(EnemyAircraft((record.get("x", 0), record.get("y", 0)), (record.get("x", 0), record.get("y", 0)), (record.get("x", 0), record.get("y", 0)), record.get("unit", "bomber")))
-                while len(self.enemy_aircraft) > len(srv_planes):
-                    self.enemy_aircraft.pop()
-                for plane, record in zip(self.enemy_aircraft, srv_planes):
-                    plane.unit = record.get("unit", plane.unit)
-                    plane.pos.update(record["x"], record["y"])
-                    plane.rect.center = plane.pos
-                    plane.hp = record["hp"]
-                    plane.max_hp = record.get("max_hp", plane.max_hp)
-                    plane.angle = record.get("angle", plane.angle)
-
-            if "items" in state:
-                srv_items = state["items"]
-                while len(self.items) < len(srv_items):
-                    record = srv_items[len(self.items)]
-                    self.items.append(Item((record.get("x", 0), record.get("y", 0)), record.get("kind", ITEM_AMMO), record.get("amount", 1)))
-                while len(self.items) > len(srv_items):
-                    self.items.pop()
-                for index, record in enumerate(srv_items):
-                    if self.items[index].kind != record.get("kind", self.items[index].kind):
-                        self.items[index] = Item((record["x"], record["y"]), record.get("kind", ITEM_AMMO), record.get("amount", 1))
-                    self.items[index].rect.center = (record["x"], record["y"])
-                    self.items[index].amount = record.get("amount", self.items[index].amount)
-
-            self.mission_started = state.get("mission_started", self.mission_started)
-            if state.get("doors_open"):
-                self.tilemap.open_doors()
-            self.capture = state.get("capture", self.capture)
-            self.result = state.get("result", self.result)
-            self.winning_team = state.get("winning_team", getattr(self, "winning_team", None))
-            self.result_reward = state.get("result_reward", self.result_reward)
-            self.stats.update(state.get("stats", {}))
-
-            # Use server bullets directly for rendering (DummyBullet)
-            if "bullets" in state:
-                self.bullets.clear()
-                for b_state in state["bullets"]:
-                    self.bullets.append(_DummyBullet(b_state["x"], b_state["y"], b_state["rot"]))
-
-            # Move camera to the bot we are controlling
-            client_mapping = state.get("client_mapping", {})
-            my_bot_idx = client_mapping.get(self.network_client.client_id, -1)
-            vehicle_mapping = state.get("vehicle_mapping", {})
             my_vehicle_idx = vehicle_mapping.get(self.network_client.client_id, -1)
             if my_bot_idx >= 0 and my_bot_idx < len(self.ally_bots):
                 bot_state = srv_bots[my_bot_idx] if my_bot_idx < len(srv_bots) else {}
@@ -2468,10 +2433,14 @@ class Game:
             self.menu_buttons.append((rect, f"tab:{tab}"))
 
     def _draw_operations_panel(self, panel: pygame.Rect) -> None:
-        for index, map_id in enumerate(self.map_ids):
+        start_index = max(0, min(self.selected_map_index - 2, len(self.map_ids) - 5))
+        visible_maps = self.map_ids[start_index:start_index + 5]
+
+        for i, map_id in enumerate(visible_maps):
+            actual_index = start_index + i
             data = MAPS[map_id]
-            rect = pygame.Rect(panel.left + 24, panel.top + 16 + index * 61, panel.width - 48, 54)
-            selected = index == self.selected_map_index
+            rect = pygame.Rect(panel.left + 24, panel.top + 16 + i * 58, panel.width - 48, 54)
+            selected = actual_index == self.selected_map_index
             color = (84, 102, 71) if selected else (35, 47, 40)
             self._draw_3d_button(
                 rect,

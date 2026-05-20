@@ -81,6 +81,42 @@ STORY_CHAPTERS: tuple[StoryChapter, ...] = (
             ("TIÊN PHONG", "Đã nhận lệnh. Chúng tôi sẽ đánh một trận khô máu. Kết thúc chuyện này thôi!"),
         ),
     ),
+    StoryChapter(
+        id="chapter_05",
+        map_id="jungle_outpost_mega",
+        title="MEGA: Tiền Đồn Rừng Sâu",
+        briefing="Bản đồ được mở rộng gấp 16 lần. Rừng rậm hơn, nhiều con đường nhỏ tuần tra hơn. Tăng số lượng kẻ địch và xe tăng, bổ sung nhiều trạm đạn/máu rải rác.",
+        objective="Sống sót trong tiền đồn khổng lồ.",
+        reward=500,
+        dialogues=(),
+    ),
+    StoryChapter(
+        id="chapter_06",
+        map_id="trench_line_mega",
+        title="MEGA: Trận Địa Chiến Hào",
+        briefing="Bản đồ mở rộng khổng lồ với các chiến hào chằng chịt.",
+        objective="Xuyên thủng phòng tuyến khổng lồ.",
+        reward=500,
+        dialogues=(),
+    ),
+    StoryChapter(
+        id="chapter_07",
+        map_id="river_bridge_mega",
+        title="MEGA: Cầu Huyết Mạch",
+        briefing="Một vùng đồng bằng rộng lớn với nhiều cây cầu.",
+        objective="Kiểm soát toàn bộ mạng lưới cầu.",
+        reward=500,
+        dialogues=(),
+    ),
+    StoryChapter(
+        id="chapter_08",
+        map_id="armored_front_mega",
+        title="MEGA: Tuyến Đầu Bọc Thép",
+        briefing="Siêu chiến trường dành cho xe tăng.",
+        objective="Chiến đấu trong siêu chiến trường xe tăng.",
+        reward=800,
+        dialogues=(),
+    ),
 )
 
 CHAPTERS_BY_MAP: dict[str, StoryChapter] = {chapter.map_id: chapter for chapter in STORY_CHAPTERS}

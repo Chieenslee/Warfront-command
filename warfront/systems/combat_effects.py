@@ -36,10 +36,14 @@ class CombatEffectEvent:
 
 
 class CombatEffects:
-    def __init__(self, particles: ParticleSystem | None = None):
+    def __init__(self, particles: ParticleSystem | None = None, event_log: list | None = None):
         self.particles = particles
+        self.event_log = event_log
 
     def spawn(self, event: CombatEffectEvent) -> CombatEffectEvent:
+        if self.event_log is not None:
+            self.event_log.append(event)
+            
         if self.particles is None:
             return event
 
