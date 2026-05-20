@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+from pathlib import Path
 
 
 Direction = str
@@ -10,6 +12,15 @@ Faction = str
 
 _DIRECTIONS = {"down", "up", "side"}
 _SOLDIER_FACTIONS = {"allied", "axis"}
+_SOLDIER_ACTION_ALIASES = {
+    "dead": "downed",
+    "death": "downed",
+    "run": "walk",
+    "shoot": "fire",
+    "shooting": "fire",
+    "melee_bash": "melee",
+    "melee_swing": "melee",
+}
 
 
 # Frame indices refer to warfront/assets/generated_assets.json groups:
@@ -100,6 +111,27 @@ TANK_ANIMATIONS: dict[Action, dict[Direction, list[int]] | list[int]] = {
 }
 
 
+def _load_animation_overrides() -> None:
+    path = Path(__file__).resolve().parents[1] / "assets" / "animations.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return
+    soldier_actions = data.get("soldier", {}).get("actions")
+    tank_actions = data.get("tank", {}).get("actions")
+    if isinstance(soldier_actions, dict):
+        for faction in SOLDIER_ANIMATIONS:
+            SOLDIER_ANIMATIONS[faction] = deepcopy(soldier_actions)
+    if isinstance(tank_actions, dict):
+        TANK_ANIMATIONS.clear()
+        TANK_ANIMATIONS.update(deepcopy(tank_actions))
+
+
+_load_animation_overrides()
+
+
 def _normalise_direction(direction: str) -> str:
     value = direction.lower()
     if value in {"left", "right"}:
@@ -113,8 +145,9 @@ def _normalise_soldier_action(action: str, direction: str | None) -> tuple[str, 
     value = action.lower()
     for suffix in ("_down", "_up", "_side", "_left", "_right"):
         if value.endswith(suffix):
-            return value[: -len(suffix)], _normalise_direction(suffix[1:])
-    return value, _normalise_direction(direction) if direction is not None else None
+            action_key = _SOLDIER_ACTION_ALIASES.get(value[: -len(suffix)], value[: -len(suffix)])
+            return action_key, _normalise_direction(suffix[1:])
+    return _SOLDIER_ACTION_ALIASES.get(value, value), _normalise_direction(direction) if direction is not None else None
 
 
 def get_soldier_frames(faction: str, action: str, direction: str | None = None) -> list[int]:

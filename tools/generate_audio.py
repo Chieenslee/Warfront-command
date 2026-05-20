@@ -9,6 +9,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SFX_DIR = ROOT / "warfront" / "assets" / "audio" / "sfx"
+MUSIC_DIR = ROOT / "warfront" / "assets" / "audio" / "music"
 SAMPLE_RATE = 44_100
 MAX_AMPLITUDE = 32_767
 
@@ -138,6 +139,110 @@ def menu_select() -> list[float]:
     return fade(render(duration, sample), attack=0.001, release=0.035)
 
 
+def tank_fire() -> list[float]:
+    rng = random.Random(51)
+    duration = 0.52
+
+    def sample(t: float) -> float:
+        cannon = sine(46.0 - 18.0 * t, t) * math.exp(-t * 5.4)
+        blast = rng.uniform(-1.0, 1.0) * math.exp(-t * 9.5)
+        metal = square(320.0, t) * math.exp(-t * 18.0)
+        return 0.62 * cannon + 0.34 * blast + 0.16 * metal
+
+    return fade(render(duration, sample), attack=0.002, release=0.14)
+
+
+def hit() -> list[float]:
+    rng = random.Random(67)
+    duration = 0.18
+
+    def sample(t: float) -> float:
+        thud = sine(110.0, t) * math.exp(-t * 18.0)
+        grit = rng.uniform(-1.0, 1.0) * math.exp(-t * 24.0)
+        return 0.36 * thud + 0.42 * grit
+
+    return fade(render(duration, sample), attack=0.001, release=0.045)
+
+
+def capture() -> list[float]:
+    duration = 0.78
+    notes = [392.0, 523.25, 659.25, 784.0]
+
+    def sample(t: float) -> float:
+        step = min(int(t / (duration / len(notes))), len(notes) - 1)
+        note = notes[step]
+        local = t % (duration / len(notes))
+        tone = sine(note, t) + 0.25 * sine(note * 2.0, t)
+        return tone * math.exp(-local * 5.5) * 0.34
+
+    return fade(render(duration, sample), attack=0.01, release=0.12)
+
+
+def battlefield_loop() -> list[float]:
+    rng = random.Random(83)
+    duration = 8.0
+
+    def sample(t: float) -> float:
+        pulse = sine(55.0, t) * (0.45 + 0.25 * sine(0.5, t))
+        distant = rng.uniform(-1.0, 1.0) * 0.12 * (0.4 + 0.6 * max(0.0, sine(0.17, t)))
+        low = sine(82.0, t) * 0.12
+        return 0.18 * pulse + distant + low
+
+    return fade(render(duration, sample), attack=0.25, release=0.55)
+
+
+def jungle_outpost_loop() -> list[float]:
+    rng = random.Random(91)
+    duration = 8.0
+
+    def sample(t: float) -> float:
+        pulse = sine(65.0, t) * (0.4 + 0.3 * sine(2.0, t))
+        distant = rng.uniform(-1.0, 1.0) * 0.08 * (0.3 + 0.7 * max(0.0, sine(0.3, t)))
+        shimmer = sine(120.0 + 30.0 * sine(1.5, t), t) * 0.06
+        return 0.16 * pulse + distant + shimmer
+
+    return fade(render(duration, sample), attack=0.25, release=0.55)
+
+
+def trench_line_loop() -> list[float]:
+    rng = random.Random(105)
+    duration = 8.0
+
+    def sample(t: float) -> float:
+        pulse = square(45.0, t) * 0.04 * (0.5 + 0.5 * sine(0.25, t))
+        distant = rng.uniform(-1.0, 1.0) * 0.15
+        low = sine(70.0, t) * 0.14
+        return pulse + distant + low
+
+    return fade(render(duration, sample), attack=0.25, release=0.55)
+
+
+def river_bridge_loop() -> list[float]:
+    rng = random.Random(119)
+    duration = 8.0
+
+    def sample(t: float) -> float:
+        pulse = sine(80.0, t) * 0.12 * (0.6 + 0.4 * sine(0.8, t))
+        distant = rng.uniform(-1.0, 1.0) * 0.09 * (0.5 + 0.5 * sine(0.12, t))
+        flowing = sine(150.0, t) * 0.08 * (0.5 + 0.5 * sine(4.0, t))
+        return pulse + distant + flowing
+
+    return fade(render(duration, sample), attack=0.25, release=0.55)
+
+
+def armored_front_loop() -> list[float]:
+    rng = random.Random(133)
+    duration = 8.0
+
+    def sample(t: float) -> float:
+        clank = square(90.0, t) * 0.05 * math.exp(-(t % 1.0) * 8.0)
+        distant = rng.uniform(-1.0, 1.0) * 0.12
+        low = sine(60.0, t) * 0.18
+        return clank + distant + low
+
+    return fade(render(duration, sample), attack=0.25, release=0.55)
+
+
 SOUNDS = {
     "rifle.wav": rifle,
     "explosion.wav": explosion,
@@ -145,6 +250,9 @@ SOUNDS = {
     "heal.wav": heal,
     "grenade.wav": grenade,
     "menu_select.wav": menu_select,
+    "tank_fire.wav": tank_fire,
+    "hit.wav": hit,
+    "capture.wav": capture,
 }
 
 
@@ -153,6 +261,19 @@ def main() -> int:
         path = SFX_DIR / filename
         write_wav(path, maker())
         print(f"Wrote {path.relative_to(ROOT)}")
+
+    # Write music loops
+    loops = {
+        "battlefield_loop.wav": battlefield_loop,
+        "jungle_outpost.wav": jungle_outpost_loop,
+        "trench_line.wav": trench_line_loop,
+        "river_bridge.wav": river_bridge_loop,
+        "armored_front.wav": armored_front_loop,
+    }
+    for filename, maker in loops.items():
+        music_path = MUSIC_DIR / filename
+        write_wav(music_path, maker())
+        print(f"Wrote {music_path.relative_to(ROOT)}")
     return 0
 
 

@@ -170,6 +170,30 @@ SHOP_ITEMS: dict[str, ShopItem] = {
         description="Unlocks the M key artillery strike using grenade ammo.",
         max_purchases=1,
     ),
+    "weapon_training": ShopItem(
+        id="weapon_training",
+        name="Weapon Training",
+        kind="upgrade",
+        cost=260,
+        description="Raises firearm damage across all equipped guns.",
+        max_purchases=5,
+    ),
+    "reload_drill": ShopItem(
+        id="reload_drill",
+        name="Reload Drill",
+        kind="upgrade",
+        cost=240,
+        description="Improves firing rhythm by reducing weapon cooldown.",
+        max_purchases=4,
+    ),
+    "field_pouches": ShopItem(
+        id="field_pouches",
+        name="Field Pouches",
+        kind="upgrade",
+        cost=190,
+        description="Deploy with more ammunition, medkits, and grenades.",
+        max_purchases=3,
+    ),
 }
 
 
@@ -197,6 +221,34 @@ class CampaignState:
         self.credits -= item.cost
         self.purchases[item_id] = self.purchases.get(item_id, 0) + 1
         return True
+
+    def to_dict(self) -> dict:
+        return {
+            "credits": self.credits,
+            "unlocked_maps": sorted(self.unlocked_maps),
+            "purchases": dict(self.purchases),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "CampaignState":
+        state = cls(
+            credits=int(data.get("credits", 99999)),
+            unlocked_maps=set(data.get("unlocked_maps", ["jungle_outpost"])),
+            purchases={str(key): int(value) for key, value in data.get("purchases", {}).items()},
+        )
+        state.unlocked_maps.add("jungle_outpost")
+        return state
+
+    def unlock_next_after(self, map_id: str) -> str | None:
+        order = [chapter.map_id for chapter in STORY_CHAPTERS]
+        if map_id not in order:
+            return None
+        index = order.index(map_id)
+        if index + 1 >= len(order):
+            return None
+        next_map = order[index + 1]
+        self.unlocked_maps.add(next_map)
+        return next_map
 
 
 __all__ = [

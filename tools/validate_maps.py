@@ -15,7 +15,8 @@ from warfront.entities.vehicles import TANK_STATS
 from warfront.world.map_data import MAPS
 
 
-SOLID = {"#", "w", "S"}
+SOLID = {"#", "w", "S", "t"}
+KNOWN_TILES = {".", "#", "w", "S", "t", "r", "g", "C", "M", "A", "D"}
 NEIGHBORS = ((1, 0), (-1, 0), (0, 1), (0, -1))
 
 
@@ -38,6 +39,10 @@ def validate_map(map_id: str, data: dict) -> list[str]:
     if any(len(row) != width for row in rows):
         failures.append(f"{map_id}: row widths are inconsistent")
         return failures
+    for y, row in enumerate(rows):
+        for x, tile in enumerate(row):
+            if tile not in KNOWN_TILES:
+                failures.append(f"{map_id}: unknown/blank tile {tile!r} at {(x, y)}")
 
     player = tuple(data["spawns"]["player"])
     passable = passable_tiles(rows)

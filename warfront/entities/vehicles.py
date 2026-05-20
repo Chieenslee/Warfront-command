@@ -90,6 +90,7 @@ class Vehicle:
         self.occupied = False
         self.occupant = None
         self.angle = 0.0
+        self.turret_angle = 0.0
         self.desired_angle = 0.0
         self.move_remainder = pygame.Vector2()
         self.reload = 0.0
@@ -119,11 +120,31 @@ class Vehicle:
         distance = max(self.rect.width, self.rect.height) * 0.75 + 18
         return pygame.Vector2(self.rect.center) + side.normalize() * distance
 
-    def exit(self):
+    def exit_candidates(self) -> list[pygame.Vector2]:
+        preferred = self.exit_position()
+        angle = math.radians(self.angle)
+        side = pygame.Vector2(-math.sin(angle), math.cos(angle))
+        if side.length_squared() == 0:
+            side = pygame.Vector2(0, 1)
+        side = side.normalize()
+        distance = max(self.rect.width, self.rect.height) * 0.75 + 18
+        opposite = pygame.Vector2(self.rect.center) - side * distance
+        heading = pygame.Vector2(math.cos(angle), math.sin(angle)).normalize()
+        behind = pygame.Vector2(self.rect.center) - heading * distance
+        front = pygame.Vector2(self.rect.center) + heading * distance
+        
+        candidates = [preferred, opposite, behind, front]
+        for deg in [45, 135, 225, 315]:
+            rad = math.radians(self.angle + deg)
+            diag = pygame.Vector2(math.cos(rad), math.sin(rad)) * distance
+            candidates.append(pygame.Vector2(self.rect.center) + diag)
+        return candidates
+
+    def exit(self, override_pos: pygame.Vector2 | None = None):
         player = self.occupant
         if player is not None:
             if hasattr(player, "rect"):
-                player.rect.center = self.exit_position()
+                player.rect.center = override_pos if override_pos is not None else self.exit_position()
             if hasattr(player, "vehicle"):
                 player.vehicle = None
         self.occupied = False
@@ -149,12 +170,16 @@ class Vehicle:
         self.flash = max(0.0, self.flash - dt)
         self.shooting_flash = max(0.0, self.shooting_flash - dt)
         self.anim_time += dt
-        self.moving = False
 
     def rotate_toward(self, target_angle: float, max_degrees: float) -> None:
         delta = ((target_angle - self.angle + 180) % 360) - 180
         delta = max(-max_degrees, min(max_degrees, delta))
         self.angle = (self.angle + delta) % 360
+
+    def rotate_turret_toward(self, target_angle: float, max_degrees: float) -> None:
+        delta = ((target_angle - self.turret_angle + 180) % 360) - 180
+        delta = max(-max_degrees, min(max_degrees, delta))
+        self.turret_angle = (self.turret_angle + delta) % 360
 
     def draw(self, screen: pygame.Surface, camera) -> None:
         view = camera.apply(self.rect)
@@ -195,10 +220,10 @@ class TankVehicle(Vehicle):
         aim = pygame.Vector2(target) - pygame.Vector2(self.rect.center)
         if aim.length_squared():
             target_angle = math.degrees(math.atan2(aim.y, aim.x))
-            delta = abs(((target_angle - self.angle + 180) % 360) - 180)
+            delta = abs(((target_angle - self.turret_angle + 180) % 360) - 180)
             if delta > 22:
                 return None
-        direction = pygame.Vector2(math.cos(math.radians(self.angle)), math.sin(math.radians(self.angle)))
+        direction = pygame.Vector2(math.cos(math.radians(self.turret_angle)), math.sin(math.radians(self.turret_angle)))
         self.reload = self.stats.reload_time
         self.shooting_flash = 0.14
 
@@ -231,11 +256,18 @@ class TankVehicle(Vehicle):
             flash.fill((255, 238, 190, 70))
             screen.blit(flash, sprite_rect)
 
+        base = pygame.Vector2(sprite_rect.centerx, sprite_rect.centery - 4)
+
         if self.shooting_flash > 0:
-            barrel = pygame.Vector2(math.cos(math.radians(self.angle)), math.sin(math.radians(self.angle)))
-            muzzle = pygame.Vector2(view.center) + barrel * (self.stats.sprite_height * 0.5)
+            barrel = pygame.Vector2(math.cos(math.radians(self.turret_angle)), math.sin(math.radians(self.turret_angle)))
+            muzzle = base + barrel * (self.stats.sprite_height * 0.5)
             pygame.draw.circle(screen, (248, 197, 82), muzzle, 8)
             pygame.draw.circle(screen, (255, 238, 190), muzzle, 4)
+
+        turret = pygame.Vector2(math.cos(math.radians(self.turret_angle)), math.sin(math.radians(self.turret_angle)))
+        end = base + turret * (self.stats.sprite_height * 0.34)
+        pygame.draw.line(screen, (40, 44, 38), base, end, 6)
+        pygame.draw.line(screen, (95, 101, 82), base, end, 3)
 
         self._draw_hp(screen, pygame.Rect(sprite_rect.left, sprite_rect.top, sprite_rect.width, sprite_rect.height))
 
@@ -243,7 +275,7 @@ class TankVehicle(Vehicle):
         indices = self._tank_indices()
         frame = indices[int(self.anim_time * 8) % len(indices)]
         sprite = get_assets().frame("m4_sherman", frame, self.stats.sprite_height)
-        return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 1 else sprite
+        return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 3 else sprite
 
     def _direction_bucket(self) -> int:
         angle = self.angle % 360

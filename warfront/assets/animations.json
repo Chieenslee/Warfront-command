@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "notes": "Frame indices reference generated_assets.json groups. Left/right use side frames with horizontal flip.",
+  "soldier": {
+    "factions": ["allied", "axis"],
+    "aliases": {
+      "run": "walk",
+      "shoot": "fire",
+      "dead": "downed",
+      "death": "downed",
+      "melee_bash": "melee",
+      "melee_swing": "melee"
+    },
+    "fps": {
+      "idle": 5,
+      "walk": 9,
+      "rifle": 5,
+      "utility": 5,
+      "fire": 16,
+      "melee": 16,
+      "downed": 8
+    },
+    "actions": {
+      "idle": {"down": [0, 1, 15, 16], "up": [27, 28, 29, 120, 121], "side": [52, 53, 54, 55]},
+      "walk": {"down": [69, 70, 71, 72, 73, 74, 75, 76], "up": [124, 125, 126, 127, 128, 129, 130, 131], "side": [36, 37, 38, 39, 40, 41, 42, 43]},
+      "rifle": {"down": [108, 109, 110, 111, 112, 113], "up": [144, 145, 146, 147], "side": [44, 45, 46, 47, 48, 49, 50, 51]},
+      "fire": {"down": [84, 86, 92], "up": [168, 169, 170], "side": [82, 163]},
+      "melee": {"down": [96, 97, 98, 99], "up": [148, 149, 150, 151], "side": [159, 160, 161, 162]},
+      "utility": {"down": [4, 5, 14, 18, 19, 122], "up": [7, 28, 29, 31, 32, 33, 34, 35], "side": [8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26]},
+      "downed": [174, 175, 176]
+    }
+  },
+  "tank": {
+    "fps": {"idle": 1, "move": 8, "fire": 10, "wreck": 6},
+    "actions": {
+      "idle": {"down": [75], "up": [88], "side": [26]},
+      "move": {"down": [75, 76, 77, 78, 79, 80, 81, 82], "up": [88, 89, 90, 91, 92, 93, 94, 95], "side": [26, 27, 28, 29, 30, 31, 32, 33]},
+      "fire": {"down": [141, 142, 143, 144, 149, 152, 153, 154, 155, 156, 157, 158], "up": [137, 138], "side": [130, 131, 132, 133]},
+      "wreck": [155, 156, 157, 158, 159]
+    }
+  }
+}
