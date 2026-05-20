@@ -5,25 +5,27 @@ from warfront.config import COLORS
 from warfront.systems.balance import UNIT_STATS
 
 
+import math
+
 class EnemyAircraft:
     def __init__(self, entry, exit, target=None, unit: str = "bomber"):
         self.unit = unit
         self.stats = UNIT_STATS["bomber"]
-        self.entry = pygame.Vector2(entry)
-        self.exit = pygame.Vector2(exit)
-        self.target_hint = pygame.Vector2(target) if target is not None else (self.entry + self.exit) * 0.5
-        self.pos = pygame.Vector2(self.entry)
+        self.center = pygame.Vector2(target) if target is not None else (pygame.Vector2(entry) + pygame.Vector2(exit)) * 0.5
+        self.radius = 280.0
+        self.angle = 0.0
+        self.pos = self.center + pygame.Vector2(self.radius, 0)
         self.rect = pygame.Rect(0, 0, 74, 46)
         self.rect.center = self.pos
         self.hp = self.stats.hp
         self.max_hp = self.stats.hp
         self.armor = self.stats.armor
         self.speed = self.stats.speed
+        self.angular_speed = self.speed / self.radius
         self.reload = 2.0
         self.bomb_cooldown = 3.0
         self.flash = 0.0
         self.anim_time = 0.0
-        self.patrol_forward = True
 
     @property
     def alive(self) -> bool:
@@ -42,34 +44,37 @@ class EnemyAircraft:
         self.flash = max(0.0, self.flash - dt)
         self.anim_time += dt
 
-        target_node = self.exit if self.patrol_forward else self.entry
-        to_node = target_node - self.pos
-        if to_node.length() < 28:
-            self.patrol_forward = not self.patrol_forward
-            target_node = self.exit if self.patrol_forward else self.entry
-            to_node = target_node - self.pos
-        if to_node.length_squared():
-            self.pos += to_node.normalize() * self.speed * dt
+        # Orbit around center
+        self.angle += self.angular_speed * dt
+        self.pos.x = self.center.x + math.cos(self.angle) * self.radius
+        # Use an elliptical orbit for isometric perspective
+        self.pos.y = self.center.y + math.sin(self.angle) * self.radius * 0.6
         self.rect.center = self.pos
 
         player = pygame.Vector2(target_pos)
-        if self.bomb_cooldown <= 0 and player.distance_to(self.pos) <= self.stats.range:
+        # Drop bomb if player is within range
+        if self.bomb_cooldown <= 0 and player.distance_to(self.pos) <= 400:
             self.bomb_cooldown = 4.8
             return player
         return None
 
     def draw(self, screen: pygame.Surface, camera) -> None:
-        direction = (self.exit - self.entry) if self.patrol_forward else (self.entry - self.exit)
-        angle = -direction.angle_to(pygame.Vector2(1, 0)) if direction.length_squared() else 0
+        dx = -math.sin(self.angle)
+        
         frame = 43 + int(self.anim_time * 10) % 8
         sprite = get_assets().frame("axis_bomber", frame, 86)
-        sprite = pygame.transform.rotate(sprite, angle)
+        
+        # Flip sprite if flying left to avoid it being upside down
+        if dx < 0:
+            sprite = pygame.transform.flip(sprite, True, False)
+            
         rect = sprite.get_rect(center=self.pos - camera.offset)
 
         shadow = pygame.Surface((rect.width, max(10, rect.height // 4)), pygame.SRCALPHA)
         pygame.draw.ellipse(shadow, (0, 0, 0, 56), shadow.get_rect())
         screen.blit(shadow, shadow.get_rect(center=(rect.centerx + 14, rect.centery + 42)))
         screen.blit(sprite, rect)
+        
         if self.flash > 0:
             flash = pygame.Surface(rect.size, pygame.SRCALPHA)
             flash.fill((255, 238, 190, 74))

@@ -25,8 +25,36 @@ from warfront.systems.weapons import WEAPONS, weapon_name
 from warfront.world import astar, bfs_nearest, dfs_reachable, grid_from_tilemap
 from warfront.world.map_data import DEFAULT_MAP_ID, MAPS
 from warfront.world.tilemap import TileMap
+from warfront.network import NetworkServer, NetworkClient
 
 SAVE_PATH = Path.home() / ".warfront_command" / "save.json"
+
+
+class _DummyBullet:
+    """Lightweight bullet used by Client to render server-authoritative bullet positions."""
+    def __init__(self, x: float, y: float, rot: float):
+        self.pos = pygame.Vector2(x, y)
+        self.rot = rot
+
+    def draw(self, surface: pygame.Surface, camera) -> None:
+        end = self.pos + pygame.Vector2(math.cos(math.radians(self.rot)), math.sin(math.radians(self.rot))) * 12
+        pygame.draw.line(surface, (255, 230, 150), camera.apply_pos(self.pos), camera.apply_pos(end), 2)
+
+    def update(self, dt: float) -> bool:
+        return True
+
+
+class _NetworkKeyState:
+    def __init__(self, keys: dict):
+        self.keys = keys
+
+    def __getitem__(self, key: int) -> bool:
+        return {
+            pygame.K_w: self.keys.get("w", False),
+            pygame.K_a: self.keys.get("a", False),
+            pygame.K_s: self.keys.get("s", False),
+            pygame.K_d: self.keys.get("d", False),
+        }.get(key, False)
 
 
 class Game:
@@ -43,22 +71,33 @@ class Game:
         pygame.mouse.set_visible(False)
         self.map_ids = list(MAPS)
         self.selected_map_index = self.map_ids.index(DEFAULT_MAP_ID)
-        self.state = "title"
+        self.state = "name_input"
+        self.previous_state = "title"
+        self.player_name = ""
+        self.host_ip = "127.0.0.1"
+        self.network_mode = "offline"
         self.menu_tab = "operations"
         self.shop_page = 0
         self.shop_filter = "all"
         self.title_buttons: list[tuple[pygame.Rect, str]] = []
-        self.title_selection = 1
+        self.title_selection = 0
         self.title_notice = ""
         self.menu_buttons: list[tuple[pygame.Rect, str]] = []
         self.result_buttons: list[tuple[pygame.Rect, str]] = []
+        self.lobby_buttons: list[tuple[pygame.Rect, str]] = []
         self.campaign = self._load_campaign()
         self.mode_config: ModeConfig = OFFLINE_CONFIG
         self.inventory = Inventory(medkits=1, grenades=1, ammo=90)
         self.weapon_mode = "rifle"
         self.equipped_primary = "rifle"
         self.equipped_sidearm = "tokarev"
+        self.cutscene_index = 0
+        self.cutscene_timer = 0.0
         self.sounds = self._load_sounds()
+        self.network_server = None
+        self.network_client = None
+        self.lobby_players = []
+        self.online_sessions: dict[str, dict] = {}
         self._start_music()
         self.reset(self.current_map_id)
 
@@ -66,18 +105,137 @@ class Game:
     def current_map_id(self) -> str:
         return self.map_ids[self.selected_map_index]
 
+    def is_online(self) -> bool:
+        return getattr(self, "network_mode", "offline") in {"host", "client"}
+
+    def is_online_pvp(self) -> bool:
+        return self.is_online() and getattr(self, "game_mode", "campaign") == "pvp"
+
+    @staticmethod
+    def _inventory_to_dict(inventory: Inventory) -> dict:
+        return {
+            "medkits": inventory.medkits,
+            "grenades": inventory.grenades,
+            "ammo": inventory.ammo,
+            "medkit_heal": inventory.medkit_heal,
+        }
+
+    @staticmethod
+    def _inventory_from_dict(data: dict | None) -> Inventory:
+        data = data or {}
+        return Inventory(
+            medkits=int(data.get("medkits", 1)),
+            grenades=int(data.get("grenades", 1)),
+            ammo=int(data.get("ammo", 90)),
+            medkit_heal=int(data.get("medkit_heal", 45)),
+        )
+
+    def _remote_team_for_slot(self, slot: int) -> str:
+        if not self.is_online_pvp():
+            return "blue"
+        # Host is blue. Clients alternate red/blue so Online 2v2 works with
+        # 1-3 joined players while the first joiner is immediately an opponent.
+        return "red" if slot % 2 == 0 else "blue"
+
+    def _display_team(self, team: str) -> str:
+        return "BLUE" if team == "blue" else "RED"
+
+    def _soldier_team_for_online(self, pvp_team: str) -> str:
+        return "enemy" if pvp_team == "red" else "player"
+
+    def _session_for_client(self, client_id: str, name: str, slot: int) -> dict:
+        session = self.online_sessions.get(client_id)
+        if session is None:
+            pouch_level = self.campaign.purchases.get("field_pouches", 0)
+            session = {
+                "id": client_id,
+                "name": name,
+                "team": self._remote_team_for_slot(slot),
+                "inventory": Inventory(medkits=1 + pouch_level, grenades=1 + pouch_level, ammo=90 + pouch_level * 20),
+                "primary": self.equipped_primary,
+                "sidearm": self.equipped_sidearm,
+                "weapon_mode": self.equipped_primary,
+                "vehicle": None,
+                "connected": True,
+                "last_slot": slot,
+            }
+            self.online_sessions[client_id] = session
+        session["name"] = name
+        session["connected"] = True
+        session["last_slot"] = slot
+        return session
+
+    def _host_player_team(self) -> str:
+        return "blue"
+
+    def _actor_team(self, actor) -> str:
+        if actor is self.player or actor is getattr(self.player, "vehicle", None):
+            return self._host_player_team()
+        return getattr(actor, "pvp_team", "blue" if getattr(actor, "team", "player") == "player" else "red")
+
+    def _player_spawn_tile(self, index: int, team: str = "blue") -> tuple[int, int]:
+        base = self.tilemap.spawns["player"]
+        if self.is_online_pvp() and team == "red" and self.tilemap.spawns.get("enemies"):
+            base = self.tilemap.spawns["enemies"][index % len(self.tilemap.spawns["enemies"])]
+        offsets = [(0, 0), (1, 0), (0, 1), (1, 1), (-1, 0), (0, -1), (-1, 1), (1, -1)]
+        for offset in offsets[index:] + offsets[:index]:
+            tile = (base[0] + offset[0], base[1] + offset[1])
+            if self.tilemap.passable_tile(tile):
+                return tile
+        return base
+
+    def _spawn_remote_player(self, index: int, name: str, pvp_team: str = "blue") -> Soldier:
+        spawn_tile = self._player_spawn_tile(index + 1, pvp_team)
+        remote = Soldier(
+            self.tilemap.spawn_position(spawn_tile),
+            is_player=False,
+            team=self._soldier_team_for_online(pvp_team),
+            bot_name=name,
+        )
+        remote.player_controlled = True
+        remote.pvp_team = pvp_team
+        remote.speed = self.player.speed
+        remote.vehicle = None
+        return remote
+
     def reset(self, map_id: str | None = None) -> None:
         if map_id and map_id in self.map_ids:
             self.selected_map_index = self.map_ids.index(map_id)
         self.tilemap = TileMap(map_id or self.current_map_id)
         self.camera = Camera(self.tilemap.width, self.tilemap.height)
         spawns = self.tilemap.spawns
-        self.player = Soldier(self.tilemap.spawn_position(spawns["player"]), is_player=True)
+        self.player = Soldier(self.tilemap.spawn_position(spawns["player"]), is_player=True, bot_name=getattr(self, "player_name", "Player"))
         self.player.weapon_pose = WEAPONS.get(self.weapon_mode, WEAPONS["rifle"]).animation_key
-        self.enemies = [Soldier(self.tilemap.spawn_position(pos)) for pos in spawns["enemies"]]
+
+        self.ally_bots = []
+        if getattr(self, "game_mode", "campaign") == "pvp":
+            if getattr(self, "network_mode", "offline") == "offline":
+                # Spawn a single enemy PVP bot far from player
+                enemy_pos = self.tilemap.spawn_position(spawns["enemies"][0] if spawns["enemies"] else (self.player.rect.x + 400, self.player.rect.y + 400))
+                bot = Soldier(enemy_pos, is_player=False, team="enemy", bot_name=f"Bot ({getattr(self, 'bot_difficulty', 'normal')})", difficulty=getattr(self, "bot_difficulty", "normal"))
+                self.enemies = [bot]
+            else:
+                self.enemies = []
+        else:
+            if getattr(self, "network_mode", "offline") == "offline":
+                # Offline: spawn 3 AI ally bots
+                for i in range(1, 4):
+                    bot_pos = (self.player.rect.x + random.randint(-40, 40), self.player.rect.y + random.randint(-40, 40))
+                    bot = Soldier(bot_pos, is_player=False, team="player", bot_name=f"Bot {i}")
+                    bot.speed = self.player.speed * 0.95
+                    self.ally_bots.append(bot)
+            # Online: do not spawn ally bots. Remote human players are created
+            # only after real clients send input, so empty slots never overlap
+            # with real accounts.
+
+            if getattr(self, "network_mode", "offline") == "client":
+                self.enemies = []
+            else:
+                self.enemies = [Soldier(self.tilemap.spawn_position(pos)) for pos in spawns["enemies"]]
+
         self.bullets = []
         self.grenades = []
-        self.enemy_aircraft = self._spawn_enemy_aircraft(spawns)
+        self.enemy_aircraft = [] if self.is_online_pvp() or getattr(self, "network_mode", "offline") == "client" else self._spawn_enemy_aircraft(spawns)
         self.mortar_shells = []
         self.melee_swings = []
         self.floaters: list[tuple[str, pygame.Vector2, tuple[int, int, int], float]] = []
@@ -90,7 +248,7 @@ class Game:
         self.player.hp = self.player.max_hp
         self.player.armor += self.campaign.purchases.get("armor", 0) * 4
         self.player.vehicle = None
-        self.enemy_vehicles = [
+        self.enemy_vehicles = [] if self.is_online_pvp() or getattr(self, "network_mode", "offline") == "client" else [
             TankVehicle(self.tilemap.spawn_position(pos), self._enemy_tank_kind(index), faction="enemy")
             for index, pos in enumerate(spawns["tanks"])
         ]
@@ -109,11 +267,14 @@ class Game:
         self.mission_elapsed = 0.0
         self.capture = 0.0
         self.result = None
+        self.winning_team = None
         self.result_awarded = False
         self.result_reward = 0
+        self.boss_triggered = False
+        self.boss_vehicle = None
         self.stats = {"inf": 0, "armor": 0, "air": 0, "supplies": 0}
         self.radio_log: list[tuple[str, tuple[int, int, int], float]] = []
-        self.add_radio(f"DEPLOY: {self.tilemap.data['title']}", (238, 203, 116), 5.0)
+        self.add_radio(f"TRIỂN KHAI: {self.tilemap.data['title']}", (238, 203, 116), 5.0)
         self._start_music()
 
     def _spawn_enemy_aircraft(self, spawns: dict) -> list[EnemyAircraft]:
@@ -171,12 +332,14 @@ class Game:
             "river_bridge": "river_bridge.wav",
             "armored_front": "armored_front.wav",
         }
-        filename = music_files.get(map_id, "battlefield_loop.wav")
-        music_path = ASSET_DIR / "audio" / "music" / filename
-        if not music_path.exists():
-            music_path = ASSET_DIR / "audio" / "music" / "battlefield_loop.wav"
+        music_dir = ASSET_DIR / "audio" / "music"
+        candidates = []
+        if map_id in music_files:
+            candidates.append(music_dir / music_files[map_id])
+        candidates.extend(music_dir / filename for filename in music_files.values())
+        music_path = next((path for path in candidates if path.exists()), None)
 
-        if not pygame.mixer.get_init() or not music_path.exists():
+        if not pygame.mixer.get_init() or music_path is None:
             return
 
         # Check if the requested music is already loaded
@@ -189,8 +352,8 @@ class Game:
             pygame.mixer.music.set_volume(0.28)
             pygame.mixer.music.play(-1)
             self._current_music_path = music_path
-        except pygame.error:
-            pass
+        except pygame.error as exc:
+            print(f"[AUDIO] Music load failed: {exc}")
 
     def _spawn_items(self) -> list[Item]:
         items = []
@@ -222,6 +385,48 @@ class Game:
     def active_actor(self):
         return self.player.vehicle if getattr(self.player, "vehicle", None) else self.player
 
+    def _actor_alive_for_team(self, actor) -> bool:
+        vehicle = getattr(actor, "vehicle", None)
+        return bool(getattr(actor, "alive", False) or (vehicle is not None and getattr(vehicle, "alive", False)))
+
+    def _controlled_actor_for(self, soldier):
+        vehicle = getattr(soldier, "vehicle", None)
+        return vehicle if vehicle is not None and vehicle.alive else soldier
+
+    def _pvp_team_alive(self, team: str) -> bool:
+        if team == self._host_player_team() and self._actor_alive_for_team(self.player):
+            return True
+        return any(
+            session.get("connected", False)
+            and getattr(session.get("actor"), "pvp_team", "blue") == team
+            and self._actor_alive_for_team(session.get("actor"))
+            for session in self.online_sessions.values()
+        ) or any(
+            self._remote_session_for_bot(bot) is None
+            and getattr(bot, "pvp_team", "blue") == team
+            and self._actor_alive_for_team(bot)
+            for bot in getattr(self, "ally_bots", [])
+        )
+
+    def _remote_session_for_bot(self, bot):
+        for session in self.online_sessions.values():
+            if session.get("actor") is bot:
+                return session
+        return None
+
+    def _weapon_for_session(self, session: dict):
+        weapon_id = session.get("weapon_mode") or session.get("primary") or "rifle"
+        return WEAPONS.get(weapon_id, WEAPONS["rifle"])
+
+    def _apply_weapon_to_bullet(self, bullet, definition, owner_team: str) -> None:
+        bullet.damage = definition.damage + self.weapon_damage_bonus()
+        bullet.speed = definition.bullet_speed
+        bullet.armor_piercing = definition.armor_piercing
+        bullet.life = max(0.35, definition.range_px / max(1, definition.bullet_speed))
+        bullet.weapon = definition.id
+        bullet.owner_team = owner_team
+        bullet.friendly = owner_team == "blue"
+
     def _move_rect(self, rect: pygame.Rect, delta: pygame.Vector2) -> pygame.Rect:
         moved = rect.copy()
         moved.x += int(delta.x)
@@ -249,12 +454,65 @@ class Game:
         flags = pygame.FULLSCREEN | pygame.SCALED if self.fullscreen else pygame.SCALED
         self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
 
+    def _poll_lobby_network(self) -> None:
+        """Called every frame while in lobby state. Syncs player list and handles game start from host."""
+        if not self.network_client:
+            return
+        if self.network_client.connected:
+            state = self.network_client.server_state
+            self.lobby_players = state.get("lobby_players", [])
+            if state.get("status") == "playing":
+                # Host has started the game - client follows
+                if self.network_mode == "client":
+                    self.game_mode = state.get("game_mode", "campaign")
+                    map_id = state.get("map_id", self.current_map_id)
+                    if map_id in self.map_ids:
+                        self.selected_map_index = self.map_ids.index(map_id)
+                    self.previous_state = "title"
+                    self.start_selected_map()
+        if self.network_mode == "host" and self.network_server:
+            # Host: keep broadcasting lobby status so clients can see player list
+            host_id = self.network_client.client_id if self.network_client else "host"
+            client_records = []
+            remote_slot = 0
+            for client in self.network_server.get_clients().values():
+                if client.get("id") == host_id:
+                    continue
+                session = self._session_for_client(client["id"], client.get("name", "Player"), remote_slot)
+                client_records.append(
+                    {
+                        "id": client["id"],
+                        "name": session["name"],
+                        "team": session["team"],
+                        "ready": client.get("ready", True),
+                        "connected": True,
+                    }
+                )
+                remote_slot += 1
+            players = [{"id": host_id, "name": self.player_name or "Host", "team": self._host_player_team(), "ready": True, "connected": True}]
+            players.extend(client_records)
+            self.lobby_players = players
+            self.network_server.broadcast_state(
+                {
+                    "status": "lobby",
+                    "map_id": self.current_map_id,
+                    "game_mode": getattr(self, "game_mode", "campaign"),
+                    "players": [p["name"] for p in players],
+                    "lobby_players": players,
+                }
+            )
+
     def run(self) -> None:
         while True:
             dt = self.clock.tick(FPS) / 1000.0
             self.handle_events()
             if self.state == "play" and not self.result:
                 self.update(dt)
+            elif self.state == "cutscene":
+                self.cutscene_timer += dt
+            elif self.state == "lobby":
+                # Poll network for lobby sync even when not in play state
+                self._poll_lobby_network()
             self.draw()
 
     def handle_events(self) -> None:
@@ -265,9 +523,61 @@ class Game:
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_F11:
                     self.toggle_fullscreen()
-                if self.state == "title" and event.key == pygame.K_ESCAPE:
-                    pygame.quit()
-                    sys.exit()
+                if self.state in ("title", "name_input", "ip_input", "pvp_menu", "lobby") and event.key == pygame.K_ESCAPE:
+                    if self.state in ("pvp_menu", "lobby"):
+                        self.state = "title"
+                        if self.network_server:
+                            self.network_server.stop()
+                            self.network_server = None
+                        if self.network_client:
+                            self.network_client.stop()
+                            self.network_client = None
+                    else:
+                        pygame.quit()
+                        sys.exit()
+
+                # Handle text input for name/IP
+                if self.state == "lobby":
+                    if event.key == pygame.K_RETURN and getattr(self, "network_mode", "offline") == "host":
+                        self.start_selected_map()
+                    continue
+                if self.state == "name_input":
+                    if event.key == pygame.K_RETURN and self.player_name.strip():
+                        self.state = "title"
+                    elif event.key == pygame.K_BACKSPACE:
+                        self.player_name = self.player_name[:-1]
+                    else:
+                        if len(self.player_name) < 12 and event.unicode.isprintable():
+                            self.player_name += event.unicode
+                    continue
+
+                if self.state == "ip_input":
+                    if event.key == pygame.K_RETURN and self.host_ip.strip():
+                        self.network_mode = "client"
+                        self.state = "lobby"
+                        if self.network_client:
+                            self.network_client.stop()
+                        self.network_client = NetworkClient(self.host_ip, self.player_name)
+                    elif event.key == pygame.K_BACKSPACE:
+                        self.host_ip = self.host_ip[:-1]
+                    elif event.key == pygame.K_ESCAPE:
+                        self.state = "title"
+                    else:
+                        if len(self.host_ip) < 16 and (event.unicode.isdigit() or event.unicode == "."):
+                            self.host_ip += event.unicode
+                    continue
+
+                if self.state == "pvp_menu":
+                    if event.key in (pygame.K_DOWN, pygame.K_s):
+                        self.pvp_selection = (getattr(self, "pvp_selection", 0) + 1) % 4
+                        self._play_sound("menu_select")
+                    elif event.key in (pygame.K_UP, pygame.K_w):
+                        self.pvp_selection = (getattr(self, "pvp_selection", 0) - 1) % 4
+                        self._play_sound("menu_select")
+                    elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                        self.run_pvp_action()
+                    continue
+
                 if self.state == "menu" and event.key == pygame.K_ESCAPE:
                     self.state = "title"
                     self._play_sound("menu_select")
@@ -279,6 +589,16 @@ class Game:
                     self._play_sound("menu_select")
                 elif self.state == "title" and event.key in (pygame.K_RETURN, pygame.K_SPACE):
                     self.run_title_action(self._title_actions()[self.title_selection][0])
+                elif self.state == "cutscene" and event.key in (pygame.K_SPACE, pygame.K_RETURN, pygame.K_ESCAPE):
+                    chapter = CHAPTERS_BY_MAP.get(self.current_map_id)
+                    if chapter and getattr(chapter, "dialogues", ()):
+                        # If typing is still happening, we can skip to end of typing (which we can't easily track without complex state, so we just advance to next line)
+                        self.cutscene_index += 1
+                        self.cutscene_timer = 0.0
+                        if self.cutscene_index >= len(chapter.dialogues):
+                            self.state = "play"
+                    else:
+                        self.state = "play"
                 elif self.state == "play" and event.key == pygame.K_ESCAPE:
                     self.state = "menu"
                 elif self.state == "menu" and event.key in (pygame.K_DOWN, pygame.K_s):
@@ -299,28 +619,33 @@ class Game:
                     self.menu_tab = "operations"
                 elif self.state == "play" and self.result and event.key == pygame.K_ESCAPE:
                     self.state = "title"
-                elif self.state == "play" and event.key == pygame.K_h:
+                elif self.state == "play" and event.key == pygame.K_h and getattr(self, "network_mode", "offline") != "client":
                     if self.inventory.use_medkit(self.player):
                         self._play_sound("heal")
-                elif self.state == "play" and event.key == pygame.K_g:
-                    self.throw_grenade(self.camera.world_mouse(pygame.mouse.get_pos()))
-                elif self.state == "play" and event.key == pygame.K_e:
-                    self.interact()
-                elif self.state == "play" and event.key == pygame.K_q:
-                    self.swing_gun_bash(self.camera.world_mouse(pygame.mouse.get_pos()))
-                elif self.state == "play" and event.key == pygame.K_1:
-                    self.weapon_mode = self.equipped_primary
-                elif self.state == "play" and event.key == pygame.K_2:
-                    self.weapon_mode = self.equipped_sidearm
-                elif self.state == "play" and event.key == pygame.K_3:
-                    self.swing_gun_bash(self.camera.world_mouse(pygame.mouse.get_pos()))
-                elif self.state == "play" and event.key == pygame.K_m:
-                    self.call_mortar(self.camera.world_mouse(pygame.mouse.get_pos()))
+                elif self.state == "play" and getattr(self, "network_mode", "offline") != "client":
+                    if event.key == pygame.K_g:
+                        self.throw_grenade(self.camera.world_mouse(pygame.mouse.get_pos()))
+                    elif event.key == pygame.K_e:
+                        self.interact()
+                    elif event.key == pygame.K_q:
+                        self.swing_gun_bash(self.camera.world_mouse(pygame.mouse.get_pos()))
+                    elif event.key == pygame.K_1:
+                        self.weapon_mode = self.equipped_primary
+                    elif event.key == pygame.K_2:
+                        self.weapon_mode = self.equipped_sidearm
+                    elif event.key == pygame.K_3:
+                        self.swing_gun_bash(self.camera.world_mouse(pygame.mouse.get_pos()))
+                    elif event.key == pygame.K_m:
+                        self.call_mortar(self.camera.world_mouse(pygame.mouse.get_pos()))
             if self.state == "title" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 self.handle_title_click(event.pos)
+            if self.state == "lobby" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                self.handle_lobby_click(event.pos)
             if self.state == "menu" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 self.handle_menu_click(event.pos)
             if self.state == "play" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not self.result:
+                if getattr(self, "network_mode", "offline") == "client":
+                    continue
                 actor = self.active_actor
                 if actor is self.player and self.inventory.ammo <= 0:
                     continue
@@ -335,9 +660,12 @@ class Game:
                         bullet.armor_piercing = definition.armor_piercing
                         bullet.life = max(0.35, definition.range_px / max(1, definition.bullet_speed))
                         bullet.weapon = "rifle"
+                        bullet.owner_team = self._actor_team(actor)
                         actor.reload = definition.cooldown * self.weapon_cooldown_scale()
                         if definition.recoil_shake:
                             self.camera.shake(definition.recoil_shake, 0.045)
+                    else:
+                        bullet.owner_team = self._actor_team(actor)
                     self.bullets.append(bullet)
                     if actor is self.player:
                         self.inventory.ammo = max(0, self.inventory.ammo - 1)
@@ -345,7 +673,8 @@ class Game:
                     self.effects.muzzle_flash(actor.rect.center, bullet.direction, "tank" if weapon == "tank" else "rifle")
                     self._play_sound("tank_fire" if weapon == "tank" else "rifle")
             if self.state == "play" and event.type == pygame.MOUSEBUTTONDOWN and event.button == 3 and not self.result:
-                self.throw_grenade(self.camera.world_mouse(event.pos))
+                if getattr(self, "network_mode", "offline") != "client":
+                    self.throw_grenade(self.camera.world_mouse(event.pos))
             if self.state == "play" and self.result and event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 self.handle_result_click(event.pos)
 
@@ -389,6 +718,7 @@ class Game:
                 continue
             if pygame.Vector2(vehicle.rect.center).distance_to(self.player.rect.center) <= 78:
                 if vehicle.enter(self.player):
+                    vehicle.pvp_team = self._host_player_team()
                     self.player.rect.center = vehicle.rect.center
                     self._play_sound("menu_select")
                 return
@@ -398,7 +728,9 @@ class Game:
             return
         start = pygame.Vector2(self.active_actor.rect.center)
         max_range = max(560, min(980, min(self.tilemap.width, self.tilemap.height) * 0.52))
-        self.grenades.append(GrenadeProjectile(start, target, max_range))
+        grenade = GrenadeProjectile(start, target, max_range)
+        grenade.owner_team = self._actor_team(self.active_actor)
+        self.grenades.append(grenade)
         self._play_sound("grenade")
 
     def swing_gun_bash(self, target) -> None:
@@ -461,10 +793,23 @@ class Game:
         friendly_scale: float,
         damage_enemies: bool = True,
         damage_allies: bool = True,
+        owner_team: str | None = None,
     ) -> None:
         target = pygame.Vector2(target)
         self.effects.bullet_hit(target, "grenade")
         self.camera.shake(1.6, 0.2)
+        if self.is_online_pvp() and owner_team in {"blue", "red"}:
+            for actor in [self.player, *getattr(self, "ally_bots", []), *self.vehicles]:
+                if not getattr(actor, "alive", False) or self._actor_team(actor) == owner_team:
+                    continue
+                distance = pygame.Vector2(actor.rect.center).distance_to(target)
+                if distance <= radius + (20 if isinstance(actor, TankVehicle) else 0):
+                    falloff = max(0.25, 1.0 - distance / max(1, radius))
+                    actual = actor.damage(int(damage * falloff), armor_piercing)
+                    self.add_floater(f"-{actual}", actor.rect.center, (255, 118, 100))
+                    if isinstance(actor, TankVehicle) and not actor.alive:
+                        self.effects.tank_explosion(actor.rect.center)
+            return
         if damage_allies:
             self.apply_blast_to_player(target, radius, damage, armor_piercing, friendly_scale)
             for vehicle in self.vehicles:
@@ -519,34 +864,90 @@ class Game:
         self.mortar_shells.append(MortarShell(target, weapon_id="mortar"))
         self._play_sound("grenade")
 
-    def detonate_grenade(self, target) -> None:
+    def detonate_grenade(self, target, owner_team: str | None = None) -> None:
         grenade = WEAPONS["grenade"]
-        self.detonate_explosion(target, damage=grenade.damage, radius=92, armor_piercing=grenade.armor_piercing, friendly_scale=0.45)
+        self.detonate_explosion(
+            target,
+            damage=grenade.damage,
+            radius=92,
+            armor_piercing=grenade.armor_piercing,
+            friendly_scale=0.45,
+            owner_team=owner_team,
+        )
 
     def _title_actions(self) -> list[tuple[str, str, str]]:
         return [
-            ("online", "BẮT ĐẦU ONLINE", "Để sẵn khung cho co-op vượt ải sau này"),
-            ("offline", "BẮT ĐẦU OFFLINE", "Vào phòng tác chiến và chọn map"),
-            ("pvp", "CHẾ ĐỘ PVP", "Để sẵn khung đấu người chơi sau này"),
-            ("maps", "DANH SÁCH MÀN CHƠI", "Xem toàn bộ nhiệm vụ hiện có"),
-            ("shop", "SHOP VŨ KHÍ", "Mua súng, vật phẩm, pháo cối và xe tăng"),
-            ("quit", "THOÁT", "Rời game"),
+            ("offline", "BẮT ĐẦU OFFLINE", "Chơi chiến dịch một mình cùng 3 Bot AI hỗ trợ."),
+            ("online", "TẠO PHÒNG (HOST)", "Làm máy chủ để mời bạn bè qua mạng LAN/IP."),
+            ("join", "VÀO PHÒNG (JOIN)", "Nhập IP để tham gia vào phòng của người khác."),
+            ("pvp", "CHẾ ĐỘ PVP", "Đấu trường sinh tử: Solo vs Bot hoặc Online 2v2."),
+            ("shop", "KHO VŨ KHÍ & NÂNG CẤP", "Mua súng, giáp, vật phẩm và xe tăng."),
+            ("quit", "THOÁT GAME", "Rời khỏi hệ thống chỉ huy."),
         ]
 
     def run_title_action(self, action: str) -> None:
         self.title_notice = ""
-        if action in {"offline", "maps"}:
+        if action == "offline":
+            self.network_mode = "offline"
+            self.menu_tab = "operations"
+            self.state = "menu"
+        elif action == "maps":
             self.menu_tab = "operations"
             self.state = "menu"
         elif action == "shop":
             self.menu_tab = "shop"
             self.state = "menu"
-        elif action in {"online", "pvp"}:
-            self.title_notice = "Chế độ online đã được giữ chỗ trong kiến trúc, sẽ nối mạng ở giai đoạn sau."
+        elif action == "online":
+            self.network_mode = "host"
+            self.state = "lobby"
+            try:
+                import socket
+                self.local_ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                self.local_ip = "127.0.0.1"
+            if self.network_server:
+                self.network_server.stop()
+            if self.network_client:
+                self.network_client.stop()
+            self.network_server = NetworkServer()
+            self.network_client = NetworkClient("127.0.0.1", self.player_name)
+            self._play_sound("menu_select")
+        elif action == "join":
+            self.state = "ip_input"
+            self._play_sound("menu_select")
+        elif action == "pvp":
+            self.state = "pvp_menu"
+            self.pvp_selection = 0
             self._play_sound("menu_select")
         elif action == "quit":
             pygame.quit()
             sys.exit()
+
+    def run_pvp_action(self) -> None:
+        actions = ["bot_easy", "bot_normal", "bot_hard", "online_2v2"]
+        action = actions[getattr(self, "pvp_selection", 0)]
+        self.game_mode = "pvp"
+        if action.startswith("bot_"):
+            self.bot_difficulty = action.split("_")[1]
+            self.network_mode = "offline"
+            self.menu_tab = "operations"
+            self.state = "menu"
+            self._play_sound("menu_select")
+        elif action == "online_2v2":
+            self.network_mode = "host"
+            self.state = "lobby"
+            try:
+                import socket
+                self.local_ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                self.local_ip = "127.0.0.1"
+            if self.network_server:
+                self.network_server.stop()
+            if self.network_client:
+                self.network_client.stop()
+            self.network_server = NetworkServer()
+            self.network_client = NetworkClient("127.0.0.1", self.player_name)
+            self._play_sound("menu_select")
 
     def handle_title_click(self, pos: tuple[int, int]) -> None:
         for index, (rect, action) in enumerate(self.title_buttons):
@@ -558,7 +959,16 @@ class Game:
     def start_selected_map(self) -> None:
         self.weapon_mode = self.equipped_primary
         self.reset(self.current_map_id)
-        self.state = "play"
+        chapter = CHAPTERS_BY_MAP.get(self.current_map_id)
+        if chapter and getattr(chapter, "dialogues", ()) and getattr(self, "network_mode", "offline") == "offline":
+            self.state = "cutscene"
+            self.cutscene_index = 0
+            self.cutscene_timer = 0.0
+        else:
+            self.state = "play"
+
+        if getattr(self, "network_mode", "offline") == "host" and self.network_server:
+            self.network_server.broadcast_state({"status": "playing", "map_id": self.current_map_id, "game_mode": getattr(self, "game_mode", "campaign")})
 
     def active_weapon(self):
         return WEAPONS.get(self.weapon_mode, WEAPONS["rifle"])
@@ -568,6 +978,29 @@ class Game:
 
     def weapon_cooldown_scale(self) -> float:
         return max(0.62, 1.0 - self.campaign.purchases.get("reload_drill", 0) * 0.07)
+
+    def handle_title_click(self, pos: tuple[int, int]) -> None:
+        for rect, action in self.title_buttons:
+            if rect.collidepoint(pos):
+                self.run_title_action(action)
+                return
+
+    def handle_lobby_click(self, pos: tuple[int, int]) -> None:
+        for rect, action in self.lobby_buttons:
+            if rect.collidepoint(pos):
+                if action == "shop":
+                    self.menu_tab = "shop"
+                    self.previous_state = "lobby"
+                    self.state = "menu"
+                    self._play_sound("menu_select")
+                elif action == "maps":
+                    self.menu_tab = "operations"
+                    self.previous_state = "lobby"
+                    self.state = "menu"
+                    self._play_sound("menu_select")
+                elif action == "start":
+                    self.start_selected_map()
+                return
 
     def handle_menu_click(self, pos: tuple[int, int]) -> None:
         for rect, action in self.menu_buttons:
@@ -593,6 +1026,14 @@ class Game:
                     self._play_sound("menu_select")
                 elif action == "title":
                     self.state = "title"
+                elif action == "back_lobby":
+                    self.previous_state = "title"
+                    self.state = "lobby"
+                    self._play_sound("menu_select")
+                elif action == "play" and getattr(self, "previous_state", "title") == "lobby":
+                    # coming from lobby, start game
+                    self.previous_state = "title"
+                    self.start_selected_map()
 
     def handle_result_click(self, pos: tuple[int, int]) -> None:
         for rect, action in self.result_buttons:
@@ -601,11 +1042,19 @@ class Game:
             self._play_sound("menu_select")
             if action == "retry":
                 self.reset()
+                self.state = "play"
             elif action == "next_map":
                 current_idx = self.map_ids.index(self.current_map_id)
                 next_idx = current_idx + 1
                 if next_idx < len(self.map_ids):
                     self.reset(self.map_ids[next_idx])
+                    chapter = CHAPTERS_BY_MAP.get(self.current_map_id)
+                    if chapter and getattr(chapter, "dialogues", ()):
+                        self.state = "cutscene"
+                        self.cutscene_index = 0
+                        self.cutscene_timer = 0.0
+                    else:
+                        self.state = "play"
             elif action == "maps":
                 self.state = "menu"
                 self.menu_tab = "operations"
@@ -656,22 +1105,47 @@ class Game:
         self._play_sound("menu_select")
 
     def update(self, dt: float) -> None:
-        self.mission_elapsed += dt
-        keys = pygame.key.get_pressed()
-        mouse_world = self.camera.world_mouse(pygame.mouse.get_pos())
-        self.player.weapon_pose = self.active_weapon().animation_key
-        if getattr(self.player, "vehicle", None):
-            self.update_player_vehicle(dt, keys, mouse_world)
-            self.player.rect.center = self.player.vehicle.rect.center
-        else:
-            self.player.update_player(dt, keys, mouse_world, self.tilemap)
-        self.camera.follow(self.active_actor.rect, self.screen.get_size(), dt)
+        # Network lobby sync (fallback check inside update in case run() missed a frame)
+        if self.state == "lobby" and getattr(self, "network_client", None) and self.network_client.connected:
+            state = self.network_client.server_state
+            if state.get("status") == "playing":
+                if self.network_mode == "client":
+                    self.game_mode = state.get("game_mode", "campaign")
+                    map_id = state.get("map_id", self.current_map_id)
+                    if map_id in self.map_ids:
+                        self.selected_map_index = self.map_ids.index(map_id)
+                    self.start_selected_map()
+
+        # Send inputs and receive state for Client
+        is_client = False
+        if self.state == "play" and getattr(self, "network_mode", "offline") == "client":
+            is_client = self._sync_client(dt)
+
+        if not is_client:
+            self.mission_elapsed += dt
+
+        if not is_client:
+            keys = pygame.key.get_pressed()
+            mouse_world = self.camera.world_mouse(pygame.mouse.get_pos())
+            self.player.weapon_pose = self.active_weapon().animation_key
+            if getattr(self.player, "vehicle", None):
+                self.update_player_vehicle(dt, keys, mouse_world)
+                self.player.rect.center = self.player.vehicle.rect.center
+            else:
+                self.player.update_player(dt, keys, mouse_world, self.tilemap)
+        if not is_client:
+            self.camera.follow(self.active_actor.rect, self.screen.get_size(), dt)
         self.mission_grace = max(0.0, self.mission_grace - dt)
         self.mortar_cooldown = max(0.0, self.mortar_cooldown - dt)
         self.melee_swings = [(pos, angle, life - dt) for pos, angle, life in self.melee_swings if life > dt]
         self.radio_log = [(text, color, life - dt) for text, color, life in self.radio_log if life > dt]
 
-        if self.mission_started:
+        if not is_client and not self.mission_started:
+            for bot in getattr(self, "ally_bots", []):
+                if getattr(bot, "player_controlled", False):
+                    continue
+
+        if self.mission_started and not is_client:
             self.ai_timer -= dt
             if self.ai_timer <= 0:
                 self.ai_timer = 0.25
@@ -688,123 +1162,683 @@ class Game:
             for enemy in self.enemies:
                 if self.mission_grace > 0:
                     enemy.reload = max(enemy.reload, self.mission_grace)
-                self.bullets.extend(enemy.update_enemy(dt, self.active_actor, self.tilemap, self.enemy_paths.get(id(enemy))))
+                # Enemies target the nearest human player (host or any client bot)
+                all_human_targets = [self.active_actor] + [b for b in getattr(self, "ally_bots", []) if b.alive and b.player_controlled]
+                nearest_target = min(all_human_targets, key=lambda t: pygame.Vector2(enemy.rect.center).distance_to(t.rect.center))
+                self.bullets.extend(enemy.update_bot(dt, [nearest_target], follow_target=nearest_target, tilemap=self.tilemap, path=self.enemy_paths.get(id(enemy))))
+
+            for bot in getattr(self, "ally_bots", []):
+                if not getattr(bot, "player_controlled", False):
+                    self.bullets.extend(bot.update_bot(dt, self.enemies + self.enemy_vehicles, self.active_actor, self.tilemap))
+
             self.update_enemy_vehicles(dt)
             self.update_enemy_aircraft(dt)
-        for vehicle in [*self.vehicles, *self.enemy_vehicles]:
-            vehicle.update(dt)
-            if vehicle.moving and random.random() < 12 * dt:
-                back_angle = (vehicle.angle + 180) % 360
-                back_dir = pygame.Vector2(math.cos(math.radians(back_angle)), math.sin(math.radians(back_angle)))
-                smoke_pos = pygame.Vector2(vehicle.rect.center) + back_dir * (vehicle.stats.size[0] * 0.4)
-                self.particles.smoke(smoke_pos, 1)
+        if not is_client:
+            for vehicle in [*self.vehicles, *self.enemy_vehicles]:
+                vehicle.update(dt)
+                if vehicle.moving and random.random() < 12 * dt:
+                    back_angle = (vehicle.angle + 180) % 360
+                    back_dir = pygame.Vector2(math.cos(math.radians(back_angle)), math.sin(math.radians(back_angle)))
+                    smoke_pos = pygame.Vector2(vehicle.rect.center) + back_dir * (vehicle.stats.size[0] * 0.4)
+                    self.particles.smoke(smoke_pos, 1)
 
-        self.pickup_items()
-        self.update_grenades(dt)
-        self.update_support_visuals(dt)
+        if not is_client:
+            self.pickup_items()
+            self.update_grenades(dt)
+            self.update_support_visuals(dt)
 
-        alive_bullets = []
-        for bullet in self.bullets:
-            if not bullet.update(dt):
-                continue
-            if bullet.friendly:
-                aircraft_hit = next((plane for plane in self.enemy_aircraft if plane.alive and plane.rect.colliderect(bullet.rect)), None)
-                if aircraft_hit:
-                    was_alive = aircraft_hit.alive
-                    actual = aircraft_hit.damage(bullet.damage, bullet.armor_piercing)
-                    self.add_floater(f"-{actual}", aircraft_hit.rect.center, (255, 226, 92))
-                    self.effects.bullet_hit(bullet.pos, "rifle")
-                    self._play_sound("hit")
-                    self.camera.shake(0.3, 0.06)
-                    if was_alive and not aircraft_hit.alive:
-                        self.register_kill("air")
-                        self.effects.bomber_strike_effect(aircraft_hit.rect.center, (0, 1), 0.85)
-                        self._play_sound("explosion")
-                        self.add_radio("ENEMY AIRCRAFT SHOT DOWN", (160, 190, 222), 4.5)
+        if not is_client:
+            alive_bullets = []
+            for bullet in self.bullets:
+                if not bullet.update(dt):
                     continue
-            if self.tilemap.bullet_blocked(bullet.rect):
-                self.particles.sparks(bullet.pos, 6)
-                continue
-            if bullet.friendly:
-                hit = next((enemy for enemy in self.enemies if enemy.alive and enemy.rect.colliderect(bullet.rect)), None)
-                if hit:
-                    was_alive = hit.alive
-                    actual = hit.damage(bullet.damage, bullet.armor_piercing)
-                    self.add_floater(f"-{actual}", hit.rect.center, (255, 214, 118))
-                    self.effects.bullet_hit(bullet.pos, bullet.weapon)
-                    self._play_sound("hit")
-                    if was_alive and not hit.alive:
-                        self.register_kill("inf")
-                        self.corpses.append((hit._current_sprite(), hit.rect.copy(), 3.0))
-                        self.effects.soldier_death_smoke(hit.rect.center, bullet.weapon)
-                        self.camera.shake(0.45, 0.08)
-                        self.add_radio("INFANTRY DOWN", (255, 214, 118))
+                if bullet.friendly:
+                    aircraft_hit = next((plane for plane in self.enemy_aircraft if plane.alive and plane.rect.colliderect(bullet.rect)), None)
+                    if aircraft_hit:
+                        was_alive = aircraft_hit.alive
+                        actual = aircraft_hit.damage(bullet.damage, bullet.armor_piercing)
+                        self.add_floater(f"-{actual}", aircraft_hit.rect.center, (255, 226, 92))
+                        self.effects.bullet_hit(bullet.pos, "rifle")
+                        self._play_sound("hit")
+                        self.camera.shake(0.3, 0.06)
+                        if was_alive and not aircraft_hit.alive:
+                            self.register_kill("air")
+                            self.effects.bomber_strike_effect(aircraft_hit.rect.center, (0, 1), 0.85)
+                            self._play_sound("explosion")
+                            self.add_radio("ENEMY AIRCRAFT SHOT DOWN", (160, 190, 222), 4.5)
+                        continue
+                if self.tilemap.bullet_blocked(bullet.rect):
+                    self.particles.sparks(bullet.pos, 6)
                     continue
-                vehicle_hit = next((vehicle for vehicle in self.enemy_vehicles if vehicle.alive and vehicle.rect.colliderect(bullet.rect)), None)
-                if vehicle_hit:
-                    was_alive = vehicle_hit.alive
-                    actual = vehicle_hit.damage(bullet.damage, bullet.armor_piercing)
-                    self.add_floater(f"-{actual}", vehicle_hit.rect.center, (255, 166, 104))
-                    self.effects.bullet_hit(bullet.pos, bullet.weapon)
-                    self._play_sound("hit")
-                    if was_alive and not vehicle_hit.alive:
-                        self.register_kill("armor")
-                        self.effects.tank_explosion(vehicle_hit.rect.center)
-                        self.camera.shake(1.4, 0.22)
-                        self._play_sound("explosion")
-                        self.add_radio("ENEMY ARMOR DESTROYED", (255, 166, 104), 4.5)
-                    continue
-            else:
-                active = self.active_actor
-                friendly_targets = [active]
-                friendly_targets.extend(vehicle for vehicle in self.vehicles if vehicle is not active)
-                if active is not self.player:
-                    friendly_targets.append(self.player)
-                hit_target = next((target for target in friendly_targets if target.alive and target.rect.colliderect(bullet.rect)), None)
-                if hit_target:
-                    actual = hit_target.damage(bullet.damage, bullet.armor_piercing)
-                    self.add_floater(f"-{actual}", hit_target.rect.center, (255, 118, 100))
-                    self.effects.bullet_hit(bullet.pos, bullet.weapon)
-                    self._play_sound("hit")
-                    self.camera.shake(0.8, 0.12)
-                    continue
-            alive_bullets.append(bullet)
-        self.bullets = alive_bullets
-        self.enemies = [enemy for enemy in self.enemies if enemy.alive]
-        self.enemy_vehicles = [vehicle for vehicle in self.enemy_vehicles if vehicle.alive]
-        self.enemy_aircraft = [plane for plane in self.enemy_aircraft if plane.alive]
-        self.vehicles = [vehicle for vehicle in self.vehicles if vehicle.alive]
+                if self.is_online_pvp() and hasattr(bullet, "owner_team"):
+                    owner_team = getattr(bullet, "owner_team", "blue")
+                    targets = [self.player, *getattr(self, "ally_bots", []), *self.vehicles]
+                    hit_target = next(
+                        (
+                            target
+                            for target in targets
+                            if getattr(target, "alive", False)
+                            and self._actor_team(target) != owner_team
+                            and target.rect.colliderect(bullet.rect)
+                        ),
+                        None,
+                    )
+                    if hit_target:
+                        was_alive = hit_target.alive
+                        actual = hit_target.damage(bullet.damage, bullet.armor_piercing)
+                        self.add_floater(f"-{actual}", hit_target.rect.center, (255, 118, 100))
+                        self.effects.bullet_hit(bullet.pos, bullet.weapon)
+                        self._play_sound("hit")
+                        self.camera.shake(0.8, 0.12)
+                        if was_alive and not hit_target.alive and isinstance(hit_target, TankVehicle):
+                            self.effects.tank_explosion(hit_target.rect.center)
+                        continue
+                if bullet.friendly:
+                    hit = next((enemy for enemy in self.enemies if enemy.alive and enemy.rect.colliderect(bullet.rect)), None)
+                    if hit:
+                        was_alive = hit.alive
+                        actual = hit.damage(bullet.damage, bullet.armor_piercing)
+                        self.add_floater(f"-{actual}", hit.rect.center, (255, 214, 118))
+                        self.effects.bullet_hit(bullet.pos, bullet.weapon)
+                        self._play_sound("hit")
+                        if was_alive and not hit.alive:
+                            self.register_kill("inf")
+                            self.corpses.append((hit._current_sprite(), hit.rect.copy(), 3.0))
+                            self.effects.soldier_death_smoke(hit.rect.center, bullet.weapon)
+                            self.camera.shake(0.45, 0.08)
+                            self.add_radio("INFANTRY DOWN", (255, 214, 118))
+                        continue
+                    vehicle_hit = next((vehicle for vehicle in self.enemy_vehicles if vehicle.alive and vehicle.rect.colliderect(bullet.rect)), None)
+                    if vehicle_hit:
+                        was_alive = vehicle_hit.alive
+                        actual = vehicle_hit.damage(bullet.damage, bullet.armor_piercing)
+                        self.add_floater(f"-{actual}", vehicle_hit.rect.center, (255, 166, 104))
+                        self.effects.bullet_hit(bullet.pos, bullet.weapon)
+                        self._play_sound("hit")
+                        if was_alive and not vehicle_hit.alive:
+                            self.register_kill("armor")
+                            self.effects.tank_explosion(vehicle_hit.rect.center)
+                            self.camera.shake(1.4, 0.22)
+                            self._play_sound("explosion")
+                            self.add_radio("ĐÃ TIÊU DIỆT XE TĂNG ĐỊCH", (255, 166, 104), 4.5)
+                        continue
+                else:
+                    active = self.active_actor
+                    friendly_targets = [active]
+                    friendly_targets.extend(vehicle for vehicle in self.vehicles if vehicle is not active)
+                    if active is not self.player:
+                        friendly_targets.append(self.player)
+                    friendly_targets.extend(getattr(self, "ally_bots", []))
+                    hit_target = next((target for target in friendly_targets if target.alive and target.rect.colliderect(bullet.rect)), None)
+                    if hit_target:
+                        actual = hit_target.damage(bullet.damage, bullet.armor_piercing)
+                        self.add_floater(f"-{actual}", hit_target.rect.center, (255, 118, 100))
+                        self.effects.bullet_hit(bullet.pos, bullet.weapon)
+                        self._play_sound("hit")
+                        self.camera.shake(0.8, 0.12)
+                        continue
+                alive_bullets.append(bullet)
+            self.bullets = alive_bullets
+            self.enemies = [enemy for enemy in self.enemies if enemy.alive]
+            self.enemy_vehicles = [vehicle for vehicle in self.enemy_vehicles if vehicle.alive]
+            self.enemy_aircraft = [plane for plane in self.enemy_aircraft if plane.alive]
+            self.vehicles = [vehicle for vehicle in self.vehicles if vehicle.alive]
+
+        # Add dead bots to corpses (host/offline only - client tracks bots via server state)
+        if not is_client:
+            if not self.is_online():
+                for bot in getattr(self, "ally_bots", []):
+                    if not bot.alive:
+                        self.corpses.append((bot._current_sprite(), bot.rect.copy(), 3.0))
+                self.ally_bots = [bot for bot in getattr(self, "ally_bots", []) if bot.alive]
+
         self.corpses = [(sprite, rect, life - dt) for sprite, rect, life in self.corpses if life > dt]
         self.floaters = [(text, pos + pygame.Vector2(0, -28 * dt), color, life - dt) for text, pos, color, life in self.floaters if life > dt]
         self.particles.update(dt)
 
-        if (
-            self.mission_started
-            and self.tilemap.capture_rect.colliderect(self.active_actor.rect)
-            and not self.enemies
-            and not self.enemy_vehicles
-            and not self.enemy_aircraft
-        ):
-            self.capture += dt
-        else:
-            self.capture = max(0.0, self.capture - dt * 0.6)
+        if not is_client:
+            if self.mission_started and self.tilemap.capture_rect.colliderect(self.active_actor.rect):
+                map_config = MAPS.get(self.current_map_id)
+                if map_config and "boss_wave" in map_config and not getattr(self, "boss_triggered", False):
+                    self.boss_triggered = True
+                    boss_data = map_config["boss_wave"]
+                    boss_pos = self.tilemap.spawn_position(boss_data["boss_spawn"])
+                    boss = TankVehicle(boss_pos, boss_data["boss_kind"], faction="enemy")
+                    self.enemy_vehicles.append(boss)
+                    self.boss_vehicle = boss
+                    for add_pos in boss_data.get("adds_spawns", []):
+                        pos = self.tilemap.spawn_position(add_pos)
+                        self.enemies.append(Soldier(pos, is_player=False))
+                    self.add_radio("CẢNH BÁO: SIÊU TĂNG HẠNG NẶNG ĐANG TIẾN LÊN!", (255, 60, 60), 8.0)
+                    self._play_sound("explosion")
+                    self.camera.shake(2.0, 0.5)
 
-        if self.player.hp <= 0 and self.result is None:
-            self.result = "MISSION FAILED"
-            self.add_radio("MISSION FAILED", (255, 118, 100), 8.0)
-        elif self.capture >= CAPTURE_SECONDS and self.result is None:
-            self.result = "VICTORY"
-            self.add_radio("SECTOR SECURED", (101, 174, 109), 8.0)
-            chapter = CHAPTERS_BY_MAP.get(self.tilemap.map_id)
-            if chapter and not self.result_awarded:
-                self.campaign.credits += chapter.reward
-                unlocked = self.campaign.unlock_next_after(self.tilemap.map_id)
-                if unlocked:
-                    self.add_radio(f"UNLOCKED: {MAPS[unlocked]['title']}", (238, 203, 116), 6.0)
-                self.result_reward = chapter.reward
-                self.result_awarded = True
-                self.save_campaign()
-                self._play_sound("capture")
+            if (
+                self.mission_started
+                and self.tilemap.capture_rect.colliderect(self.active_actor.rect)
+                and not self.enemies
+                and not self.enemy_vehicles
+                and not self.enemy_aircraft
+            ):
+                self.capture += dt
+            else:
+                self.capture = max(0.0, self.capture - dt * 0.6)
+
+            if getattr(self, "game_mode", "campaign") == "pvp":
+                if self.is_online_pvp():
+                    red_has_joined = any(session.get("team") == "red" for session in self.online_sessions.values())
+                    blue_alive = self._pvp_team_alive("blue")
+                    red_alive = self._pvp_team_alive("red")
+                    if red_has_joined and self.result is None:
+                        if blue_alive and not red_alive:
+                            self.result = "VICTORY"
+                            self.winning_team = "blue"
+                            self.add_radio("BLUE TEAM WINS", (101, 174, 109), 8.0)
+                            self.result_reward = 150
+                            self.result_awarded = True
+                            self.campaign.credits += self.result_reward
+                            self.save_campaign()
+                            self._play_sound("capture")
+                        elif red_alive and not blue_alive:
+                            self.result = "DEFEAT"
+                            self.winning_team = "red"
+                            self.add_radio("RED TEAM WINS", (255, 118, 100), 8.0)
+                else:
+                    if self.player.hp <= 0 and self.result is None:
+                        self.result = "DEFEAT"
+                        self.winning_team = "enemy"
+                        self.add_radio("BẠN ĐÃ BỊ HẠ GỤC", (255, 118, 100), 8.0)
+                    elif not self.enemies and self.result is None:
+                        self.result = "VICTORY"
+                        self.winning_team = "blue"
+                        self.add_radio("ĐÃ TIÊU DIỆT MỤC TIÊU", (101, 174, 109), 8.0)
+                        self.result_reward = 150 # PVP reward
+                        self.result_awarded = True
+                        self.campaign.credits += self.result_reward
+                        self.save_campaign()
+                        self._play_sound("capture")
+            else:
+                if self.player.hp <= 0 and self.result is None:
+                    self.result = "MISSION FAILED"
+                    self.winning_team = "enemy"
+                    self.add_radio("NHIỆM VỤ THẤT BẠI", (255, 118, 100), 8.0)
+                elif self.capture >= CAPTURE_SECONDS and self.result is None:
+                    if getattr(self, "boss_triggered", False) and getattr(self, "boss_vehicle", None) and self.boss_vehicle.alive:
+                        pass # Wait for boss to die
+                    else:
+                        self.result = "VICTORY"
+                        self.winning_team = "blue"
+                        self.add_radio("ĐÃ KIỂM SOÁT KHU VỰC", (101, 174, 109), 8.0)
+                        chapter = CHAPTERS_BY_MAP.get(self.tilemap.map_id)
+                        if chapter and not self.result_awarded:
+                            self.campaign.credits += chapter.reward
+                            unlocked = self.campaign.unlock_next_after(self.tilemap.map_id)
+                            if unlocked:
+                                self.add_radio(f"ĐÃ MỞ KHÓA: {MAPS[unlocked]['title']}", (238, 203, 116), 6.0)
+                            self.result_reward = chapter.reward
+                            self.result_awarded = True
+                            self.save_campaign()
+                            self._play_sound("capture")
+
+        # Network Host state serialization
+        if getattr(self, "network_mode", "offline") == "host":
+            self._sync_host(dt)
+
+    def _sync_host(self, dt: float) -> None:
+        if not self.network_server:
+            return
+
+        host_client_id = self.network_client.client_id if getattr(self, "network_client", None) else None
+
+        # Process real remote clients only. The host also owns a local loopback
+        # client for lobby sync; skip it so it never creates a fake P2.
+        client_inputs = [
+            (addr, data)
+            for addr, data in self.network_server.get_clients().items()
+            if data["id"] != host_client_id
+        ]
+        client_mapping = {}
+        vehicle_mapping = {}
+        connected_ids = {data["id"] for _addr, data in client_inputs}
+        for session in self.online_sessions.values():
+            session["connected"] = session["id"] in connected_ids
+        while len(self.ally_bots) < len(client_inputs):
+            self.ally_bots.append(self._spawn_remote_player(len(self.ally_bots), f"P{len(self.ally_bots) + 2}"))
+
+        for bot_idx, (_addr, data) in enumerate(client_inputs):
+            session = self._session_for_client(data["id"], data.get("name", f"P{bot_idx + 2}"), bot_idx)
+            bot = session.get("actor")
+            if bot is None or bot not in self.ally_bots:
+                if bot_idx < len(self.ally_bots) and self._remote_session_for_bot(self.ally_bots[bot_idx]) is None:
+                    bot = self.ally_bots[bot_idx]
+                else:
+                    bot = self._spawn_remote_player(bot_idx, session["name"], session["team"])
+                    self.ally_bots.append(bot)
+                session["actor"] = bot
+            bot.bot_name = session["name"]
+            bot.player_controlled = True
+            bot.pvp_team = session["team"]
+            bot.team = self._soldier_team_for_online(session["team"])
+            actor = self._controlled_actor_for(bot)
+            inputs = data["inputs"]
+            if inputs:
+                keys = inputs.get("keys", {})
+                actor = self._controlled_actor_for(bot)
+                mx, my = inputs.get("mouse_world", [actor.rect.centerx, actor.rect.centery])
+                now_ms = pygame.time.get_ticks()
+
+                weapon_id = inputs.get("weapon_mode", session.get("weapon_mode", session.get("primary", "rifle")))
+                if inputs.get("weapon1"):
+                    weapon_id = session.get("primary", self.equipped_primary)
+                elif inputs.get("weapon2"):
+                    weapon_id = session.get("sidearm", self.equipped_sidearm)
+                if weapon_id in WEAPONS:
+                    session["weapon_mode"] = weapon_id
+                definition = self._weapon_for_session(session)
+                bot.weapon_pose = definition.animation_key
+
+                inventory = session["inventory"]
+                if inputs.get("shoot") and actor.reload <= 0:
+                    if actor is bot and inventory.ammo <= 0:
+                        bullet = None
+                    else:
+                        bullet = actor.shoot(pygame.Vector2(mx, my))
+                    if bullet:
+                        if actor is bot:
+                            spread = random.uniform(-definition.spread_degrees, definition.spread_degrees)
+                            bullet.direction = bullet.direction.rotate(spread)
+                            self._apply_weapon_to_bullet(bullet, definition, session["team"])
+                            actor.reload = definition.cooldown * self.weapon_cooldown_scale()
+                            inventory.ammo = max(0, inventory.ammo - 1)
+                        else:
+                            bullet.owner_team = session["team"]
+                            bullet.friendly = session["team"] == "blue"
+                        self.bullets.append(bullet)
+                        self.effects.muzzle_flash(actor.rect.center, bullet.direction, "tank" if getattr(bullet, "weapon", "") == "tank" else "rifle")
+                        self._play_sound("tank_fire" if getattr(bullet, "weapon", "") == "tank" else "rifle")
+
+                if actor is bot:
+                    bot.update_player(dt, _NetworkKeyState(keys), pygame.Vector2(mx, my), self.tilemap)
+                    bot.weapon_pose = definition.animation_key
+                else:
+                    actor.moving = False
+                    turn = int(keys.get("d", False)) - int(keys.get("a", False))
+                    throttle = int(keys.get("w", False)) - int(keys.get("s", False))
+                    aim = pygame.Vector2(mx, my) - pygame.Vector2(actor.rect.center)
+                    if aim.length_squared():
+                        actor.rotate_turret_toward(math.degrees(math.atan2(aim.y, aim.x)), 145 * dt)
+                    if turn:
+                        actor.angle = (actor.angle + turn * 95 * dt) % 360
+                    if throttle:
+                        facing = pygame.Vector2(math.cos(math.radians(actor.angle)), math.sin(math.radians(actor.angle)))
+                        self._move_vehicle(actor, facing * actor.speed * throttle * dt)
+                    bot.rect.center = actor.rect.center
+
+                if inputs.get("interact") and now_ms - getattr(bot, "_net_interact_ms", -99999) >= 450:
+                    bot._net_interact_ms = now_ms
+                    near_door = any(
+                        pygame.Vector2(actor.rect.center).distance_to(door.center) <= 140
+                        for door in self.tilemap.door_rects
+                    ) if not self.tilemap.doors_open else False
+                    if near_door:
+                        self.tilemap.open_doors()
+                        self.mission_started = True
+                        self.mission_grace = 1.5
+                        self.add_radio(f"{bot.bot_name} OPENED SAFE-ROOM GATE", (238, 203, 116), 4.0)
+                        self._play_sound("capture")
+                    elif getattr(bot, "vehicle", None):
+                        vehicle = bot.vehicle
+                        for pos in vehicle.exit_candidates():
+                            exit_rect = bot.rect.copy()
+                            exit_rect.center = pos
+                            if not self.tilemap.blocked(exit_rect):
+                                vehicle.exit(override_pos=pos)
+                                session["vehicle"] = None
+                                break
+                    else:
+                        for vehicle in self.vehicles:
+                            if vehicle.alive and not vehicle.occupied and pygame.Vector2(vehicle.rect.center).distance_to(bot.rect.center) <= 78:
+                                if vehicle.enter(bot):
+                                    vehicle.pvp_team = session["team"]
+                                    bot.rect.center = vehicle.rect.center
+                                    session["vehicle"] = self.vehicles.index(vehicle)
+                                    self._play_sound("menu_select")
+                                break
+
+                if inputs.get("medkit") and now_ms - getattr(bot, "_net_medkit_ms", -99999) >= 8000:
+                    if inventory.use_medkit(bot):
+                        bot._net_medkit_ms = now_ms
+                        self.add_floater("+55", bot.rect.center, (108, 224, 116))
+                        self._play_sound("heal")
+
+                if inputs.get("melee") and now_ms - getattr(bot, "_net_melee_ms", -99999) >= 420:
+                    bot._net_melee_ms = now_ms
+                    bash = WEAPONS["gun_bash"]
+                    bot.melee_flash = 0.16
+                    self.melee_swings.append((pygame.Vector2(bot.rect.center), bot.aim_angle, 0.16))
+                    origin = pygame.Vector2(bot.rect.center)
+                    facing = pygame.Vector2(math.cos(math.radians(bot.aim_angle)), math.sin(math.radians(bot.aim_angle)))
+                    targets = [*self.enemies, *self.enemy_vehicles]
+                    if self.is_online_pvp():
+                        targets.extend(
+                            other for other in [self.player, *self.ally_bots] if other is not bot and self._actor_team(other) != session["team"]
+                        )
+                    for target in targets:
+                        to_target = pygame.Vector2(target.rect.center) - origin
+                        if to_target.length() <= bash.range_px and (
+                            not to_target.length_squared() or facing.dot(to_target.normalize()) > 0.18
+                        ):
+                            actual = target.damage(bash.damage, bash.armor_piercing)
+                            self.add_floater(f"-{actual}", target.rect.center, (255, 226, 128))
+                            self.effects.bullet_hit(target.rect.center, "gun_bash")
+
+                if inputs.get("grenade") and now_ms - getattr(bot, "_net_grenade_ms", -99999) >= 1300 and inventory.use_grenade():
+                    bot._net_grenade_ms = now_ms
+                    grenade = WEAPONS["grenade"]
+                    projectile = GrenadeProjectile(actor.rect.center, pygame.Vector2(mx, my), grenade.range_px)
+                    projectile.owner_team = session["team"]
+                    self.grenades.append(projectile)
+                    self._play_sound("grenade")
+
+                if inputs.get("mortar") and now_ms - getattr(bot, "_net_mortar_ms", -99999) >= 7500 and inventory.grenades > 0:
+                    target = pygame.Vector2(mx, my)
+                    if pygame.Vector2(actor.rect.center).distance_to(target) <= WEAPONS["mortar"].range_px:
+                        bot._net_mortar_ms = now_ms
+                        inventory.grenades -= 1
+                        self.mortar_shells.append(MortarShell(target, weapon_id="mortar", hostile=False))
+                        self.add_radio(f"{bot.bot_name} MORTAR SUPPORT", (238, 203, 116), 3.0)
+
+        for client_id, session in self.online_sessions.items():
+            bot = session.get("actor")
+            if bot in self.ally_bots:
+                client_mapping[client_id] = self.ally_bots.index(bot)
+                actor = self._controlled_actor_for(bot)
+                if actor is not bot and actor in self.vehicles:
+                    vehicle_mapping[client_id] = self.vehicles.index(actor)
+
+        # Serialize state
+        def serialize_soldier(s):
+            session = self._remote_session_for_bot(s)
+            vehicle = getattr(s, "vehicle", None)
+            return {
+                "x": s.rect.centerx,
+                "y": s.rect.centery,
+                "hp": s.hp,
+                "max_hp": s.max_hp,
+                "aim": s.aim_angle,
+                "alive": s.alive,
+                "name": s.bot_name,
+                "team": getattr(s, "team", "player"),
+                "pvp_team": getattr(s, "pvp_team", self._host_player_team() if s is self.player else "blue"),
+                "pose": getattr(s, "weapon_pose", "rifle"),
+                "weapon_mode": session.get("weapon_mode", "rifle") if session else self.weapon_mode,
+                "inventory": self._inventory_to_dict(session["inventory"]) if session else self._inventory_to_dict(self.inventory),
+                "vehicle_index": self.vehicles.index(vehicle) if vehicle in self.vehicles else -1,
+                "moving": getattr(s, "moving", False),
+                "angle": getattr(s, "angle", 0.0),
+                "move_angle": getattr(s, "move_angle", 0.0),
+                "shooting_flash": getattr(s, "shooting_flash", 0.0),
+                "melee_flash": getattr(s, "melee_flash", 0.0),
+                "anim_time": getattr(s, "anim_time", 0.0),
+                "anim_state": getattr(s, "anim_state", "idle_down"),
+            }
+
+        def serialize_vehicle(v):
+            return {
+                "x": v.rect.centerx,
+                "y": v.rect.centery,
+                "hp": v.hp,
+                "max_hp": v.max_hp,
+                "kind": getattr(v, "kind", "sherman"),
+                "faction": getattr(v, "faction", "enemy"),
+                "angle": getattr(v, "angle", 0.0),
+                "turret": getattr(v, "turret_angle", getattr(v, "angle", 0.0)),
+                "moving": getattr(v, "moving", False),
+                "shooting_flash": getattr(v, "shooting_flash", 0.0),
+                "anim_time": getattr(v, "anim_time", 0.0),
+                "owner_id": next((sid for sid, session in self.online_sessions.items() if getattr(session.get("actor"), "vehicle", None) is v), ""),
+                "owner_team": next((session["team"] for session in self.online_sessions.values() if getattr(session.get("actor"), "vehicle", None) is v), self._host_player_team() if v is getattr(self.player, "vehicle", None) else ""),
+                "alive": v.alive,
+            }
+
+        def serialize_aircraft(a):
+            return {
+                "x": a.rect.centerx,
+                "y": a.rect.centery,
+                "hp": a.hp,
+                "max_hp": a.max_hp,
+                "unit": getattr(a, "unit", "bomber"),
+                "angle": getattr(a, "angle", 0.0),
+                "alive": a.alive,
+            }
+
+        def serialize_item(item):
+            return {
+                "x": item.rect.centerx,
+                "y": item.rect.centery,
+                "kind": item.kind,
+                "amount": item.amount,
+            }
+
+        boss_index = -1
+        if getattr(self, "boss_vehicle", None) in self.enemy_vehicles:
+            boss_index = self.enemy_vehicles.index(self.boss_vehicle)
+
+        state = {
+            "status": "playing",
+            "map_id": self.current_map_id,
+            "player": serialize_soldier(self.player),
+            "ally_bots": [serialize_soldier(b) for b in self.ally_bots],
+            "enemies": [serialize_soldier(e) for e in self.enemies],
+            "enemy_vehicles": [serialize_vehicle(v) for v in self.enemy_vehicles],
+            "vehicles": [serialize_vehicle(v) for v in self.vehicles],
+            "enemy_aircraft": [serialize_aircraft(a) for a in self.enemy_aircraft],
+            "items": [serialize_item(item) for item in self.items],
+            "bullets": [
+                {"x": b.pos.x, "y": b.pos.y, "rot": math.degrees(math.atan2(b.direction.y, b.direction.x))}
+                for b in self.bullets
+                if hasattr(b, "direction")
+            ],
+            "client_mapping": client_mapping,
+            "vehicle_mapping": vehicle_mapping,
+            "host_inventory": self._inventory_to_dict(self.inventory),
+            "mission_started": self.mission_started,
+            "doors_open": self.tilemap.doors_open,
+            "capture": self.capture,
+            "result": self.result,
+            "winning_team": getattr(self, "winning_team", None),
+            "result_reward": self.result_reward,
+            "stats": self.stats,
+            "boss_index": boss_index,
+        }
+        self.network_server.broadcast_state(state)
+
+    def _sync_client(self, dt: float) -> bool:
+        if not getattr(self, "network_client", None) or not self.network_client.connected:
+            return False
+
+        # Gather local inputs
+        keys = pygame.key.get_pressed()
+        mouse_world = self.camera.world_mouse(pygame.mouse.get_pos())
+        mouse_buttons = pygame.mouse.get_pressed()
+        if keys[pygame.K_1]:
+            self.weapon_mode = self.equipped_primary
+        elif keys[pygame.K_2]:
+            self.weapon_mode = self.equipped_sidearm
+
+        inputs = {
+            "keys": {"w": keys[pygame.K_w], "a": keys[pygame.K_a], "s": keys[pygame.K_s], "d": keys[pygame.K_d]},
+            "mouse_world": [mouse_world.x, mouse_world.y],
+            "shoot": mouse_buttons[0],
+            "grenade": keys[pygame.K_g] or mouse_buttons[2],
+            "medkit": keys[pygame.K_h],
+            "melee": keys[pygame.K_q],
+            "mortar": keys[pygame.K_m],
+            "interact": keys[pygame.K_e],
+            "weapon1": keys[pygame.K_1],
+            "weapon2": keys[pygame.K_2],
+            "pose": self.active_weapon().animation_key,
+            "weapon_mode": self.weapon_mode,
+        }
+        self.network_client.update_inputs(inputs)
+
+        # Override local state with server state
+        state = self.network_client.server_state
+        if state.get("status") == "playing":
+            def apply_soldier_anim(soldier: Soldier, payload: dict, previous_center=None) -> None:
+                soldier.max_hp = payload.get("max_hp", soldier.max_hp)
+                soldier.aim_angle = payload.get("aim", soldier.aim_angle)
+                soldier.angle = payload.get("angle", soldier.aim_angle)
+                soldier.move_angle = payload.get("move_angle", soldier.move_angle)
+                soldier.team = payload.get("team", soldier.team)
+                soldier.pvp_team = payload.get("pvp_team", getattr(soldier, "pvp_team", "blue"))
+                soldier.weapon_pose = payload.get("pose", soldier.weapon_pose)
+                soldier.shooting_flash = payload.get("shooting_flash", 0.0)
+                soldier.melee_flash = payload.get("melee_flash", 0.0)
+                if "anim_state" in payload and payload["anim_state"] != soldier.anim_state:
+                    soldier.anim_state = payload["anim_state"]
+                    soldier.anim_time = payload.get("anim_time", 0.0)
+                else:
+                    soldier.anim_time = payload.get("anim_time", soldier.anim_time)
+                if "moving" in payload:
+                    soldier.moving = payload["moving"]
+                elif previous_center is not None:
+                    soldier.moving = pygame.Vector2(soldier.rect.center).distance_to(previous_center) > 1
+                if not payload.get("alive", True):
+                    soldier.hp = 0
+
+            if "player" in state:
+                p = state["player"]
+                previous_center = pygame.Vector2(self.player.rect.center)
+                self.player.rect.center = (p["x"], p["y"])
+                self.player.hp = p["hp"]
+                apply_soldier_anim(self.player, p, previous_center)
+
+            srv_bots = state.get("ally_bots", [])
+            # Dynamically resize ally_bots list to match server
+            while len(self.ally_bots) < len(srv_bots):
+                bot_pos = self.player.rect.center
+                new_bot = Soldier(bot_pos, is_player=False, team="player", bot_name=f"P{len(self.ally_bots)+2}")
+                new_bot.player_controlled = True
+                self.ally_bots.append(new_bot)
+            while len(self.ally_bots) > len(srv_bots):
+                self.ally_bots.pop()
+
+            for i, b_state in enumerate(srv_bots):
+                previous_center = pygame.Vector2(self.ally_bots[i].rect.center)
+                self.ally_bots[i].rect.center = (b_state["x"], b_state["y"])
+                self.ally_bots[i].hp = b_state["hp"]
+                self.ally_bots[i].bot_name = b_state.get("name", f"P{i+2}")
+                self.ally_bots[i].player_controlled = True
+                apply_soldier_anim(self.ally_bots[i], b_state, previous_center)
+
+            if "enemies" in state:
+                srv_enemies = state["enemies"]
+                while len(self.enemies) < len(srv_enemies):
+                    new_enemy = Soldier(self.player.rect.center, is_player=False, team="enemy", bot_name="Enemy")
+                    self.enemies.append(new_enemy)
+                while len(self.enemies) > len(srv_enemies):
+                    self.enemies.pop()
+                for i, e_state in enumerate(srv_enemies):
+                    previous_center = pygame.Vector2(self.enemies[i].rect.center)
+                    self.enemies[i].rect.center = (e_state["x"], e_state["y"])
+                    self.enemies[i].hp = e_state["hp"]
+                    apply_soldier_anim(self.enemies[i], e_state, previous_center)
+
+            def sync_tanks(target_list: list[TankVehicle], records: list[dict], faction: str) -> None:
+                while len(target_list) < len(records):
+                    record = records[len(target_list)]
+                    target_list.append(TankVehicle((record.get("x", 0), record.get("y", 0)), record.get("kind", "sherman"), faction=faction))
+                while len(target_list) > len(records):
+                    target_list.pop()
+                for tank, record in zip(target_list, records):
+                    if getattr(tank, "kind", None) != record.get("kind", tank.kind):
+                        tank.__init__((record.get("x", tank.rect.centerx), record.get("y", tank.rect.centery)), record.get("kind", "sherman"), faction=record.get("faction", faction))
+                    tank.rect.center = (record["x"], record["y"])
+                    tank.hp = record["hp"]
+                    tank.max_hp = record.get("max_hp", tank.max_hp)
+                    tank.angle = record.get("angle", tank.angle)
+                    tank.turret_angle = record.get("turret", tank.turret_angle)
+                    tank.faction = record.get("faction", faction)
+                    tank.pvp_team = record.get("owner_team", getattr(tank, "pvp_team", "blue"))
+                    tank.moving = record.get("moving", tank.moving)
+                    tank.shooting_flash = record.get("shooting_flash", 0.0)
+                    tank.anim_time = record.get("anim_time", tank.anim_time)
+                    tank.occupied = bool(record.get("owner_id"))
+
+            if "enemy_vehicles" in state:
+                sync_tanks(self.enemy_vehicles, state["enemy_vehicles"], "enemy")
+                boss_index = state.get("boss_index", -1)
+                self.boss_vehicle = self.enemy_vehicles[boss_index] if 0 <= boss_index < len(self.enemy_vehicles) else None
+
+            if "vehicles" in state:
+                sync_tanks(self.vehicles, state["vehicles"], "ally")
+
+            if "enemy_aircraft" in state:
+                srv_planes = state["enemy_aircraft"]
+                while len(self.enemy_aircraft) < len(srv_planes):
+                    record = srv_planes[len(self.enemy_aircraft)]
+                    self.enemy_aircraft.append(EnemyAircraft((record.get("x", 0), record.get("y", 0)), (record.get("x", 0), record.get("y", 0)), (record.get("x", 0), record.get("y", 0)), record.get("unit", "bomber")))
+                while len(self.enemy_aircraft) > len(srv_planes):
+                    self.enemy_aircraft.pop()
+                for plane, record in zip(self.enemy_aircraft, srv_planes):
+                    plane.unit = record.get("unit", plane.unit)
+                    plane.pos.update(record["x"], record["y"])
+                    plane.rect.center = plane.pos
+                    plane.hp = record["hp"]
+                    plane.max_hp = record.get("max_hp", plane.max_hp)
+                    plane.angle = record.get("angle", plane.angle)
+
+            if "items" in state:
+                srv_items = state["items"]
+                while len(self.items) < len(srv_items):
+                    record = srv_items[len(self.items)]
+                    self.items.append(Item((record.get("x", 0), record.get("y", 0)), record.get("kind", ITEM_AMMO), record.get("amount", 1)))
+                while len(self.items) > len(srv_items):
+                    self.items.pop()
+                for index, record in enumerate(srv_items):
+                    if self.items[index].kind != record.get("kind", self.items[index].kind):
+                        self.items[index] = Item((record["x"], record["y"]), record.get("kind", ITEM_AMMO), record.get("amount", 1))
+                    self.items[index].rect.center = (record["x"], record["y"])
+                    self.items[index].amount = record.get("amount", self.items[index].amount)
+
+            self.mission_started = state.get("mission_started", self.mission_started)
+            if state.get("doors_open"):
+                self.tilemap.open_doors()
+            self.capture = state.get("capture", self.capture)
+            self.result = state.get("result", self.result)
+            self.winning_team = state.get("winning_team", getattr(self, "winning_team", None))
+            self.result_reward = state.get("result_reward", self.result_reward)
+            self.stats.update(state.get("stats", {}))
+
+            # Use server bullets directly for rendering (DummyBullet)
+            if "bullets" in state:
+                self.bullets.clear()
+                for b_state in state["bullets"]:
+                    self.bullets.append(_DummyBullet(b_state["x"], b_state["y"], b_state["rot"]))
+
+            # Move camera to the bot we are controlling
+            client_mapping = state.get("client_mapping", {})
+            my_bot_idx = client_mapping.get(self.network_client.client_id, -1)
+            vehicle_mapping = state.get("vehicle_mapping", {})
+            my_vehicle_idx = vehicle_mapping.get(self.network_client.client_id, -1)
+            if my_bot_idx >= 0 and my_bot_idx < len(self.ally_bots):
+                bot_state = srv_bots[my_bot_idx] if my_bot_idx < len(srv_bots) else {}
+                if self.winning_team in {"blue", "red"} and self.result:
+                    self.result = "VICTORY" if bot_state.get("pvp_team") == self.winning_team else "DEFEAT"
+                self.inventory = self._inventory_from_dict(bot_state.get("inventory"))
+                if 0 <= my_vehicle_idx < len(self.vehicles):
+                    self.ally_bots[my_bot_idx].vehicle = self.vehicles[my_vehicle_idx]
+                    self.ally_bots[my_bot_idx].rect.center = self.vehicles[my_vehicle_idx].rect.center
+                    self.camera.follow(self.vehicles[my_vehicle_idx].rect, self.screen.get_size(), dt)
+                else:
+                    self.ally_bots[my_bot_idx].vehicle = None
+                    self.camera.follow(self.ally_bots[my_bot_idx].rect, self.screen.get_size(), dt)
+            else:
+                # Fallback: camera follows server player position
+                self.inventory = self._inventory_from_dict(state.get("host_inventory"))
+                self.camera.follow(self.player.rect, self.screen.get_size(), dt)
+        return True
 
     def update_grenades(self, dt: float) -> None:
         live_grenades = []
@@ -812,7 +1846,7 @@ class Game:
             if grenade.update(dt):
                 live_grenades.append(grenade)
             else:
-                self.detonate_grenade(grenade.target)
+                self.detonate_grenade(grenade.target, getattr(grenade, "owner_team", None))
         self.grenades = live_grenades
 
     def update_support_visuals(self, dt: float) -> None:
@@ -922,18 +1956,194 @@ class Game:
     def pickup_items(self) -> None:
         remaining = []
         for item in self.items:
-            if self.player.rect.colliderect(item.rect):
-                self.inventory.add_item(item)
-                self.stats["supplies"] += 1
-                self._play_sound("pickup")
-                self.particles.sparks(item.rect.center, 5)
-                self.add_floater(f"+{item.kind.upper()}", item.rect.center, (132, 232, 138), 0.9)
-                self.add_radio(f"SUPPLY PICKUP: {item.kind.upper()}", (132, 232, 138), 3.2)
-            else:
+            picked_up = False
+            targets = [(self.player, self.inventory)]
+            for bot in getattr(self, "ally_bots", []):
+                if bot.alive and getattr(bot, "player_controlled", False):
+                    session = self._remote_session_for_bot(bot)
+                    targets.append((bot, session["inventory"] if session else self.inventory))
+            for target, inventory in targets:
+                if target.rect.colliderect(item.rect):
+                    inventory.add_item(item)
+                    self.stats["supplies"] += 1
+                    self._play_sound("pickup")
+                    self.particles.sparks(item.rect.center, 5)
+                    self.add_floater(f"+{item.kind.upper()}", item.rect.center, (132, 232, 138), 0.9)
+                    self.add_radio(f"SUPPLY PICKUP: {item.kind.upper()}", (132, 232, 138), 3.2)
+                    picked_up = True
+                    break
+            if not picked_up:
                 remaining.append(item)
         self.items = remaining
 
     def draw(self) -> None:
+        if self.state == "name_input":
+            self._draw_menu_background()
+            title = self.big_font.render("WARFRONT COMMAND", True, (245, 232, 184))
+            self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 150)))
+            prompt = self.font.render("Nhập Tên Chỉ Huy Của Bạn:", True, (189, 204, 168))
+            self.screen.blit(prompt, prompt.get_rect(center=(SCREEN_WIDTH // 2, 250)))
+
+            box = pygame.Rect(SCREEN_WIDTH // 2 - 150, 300, 300, 50)
+            pygame.draw.rect(self.screen, (24, 30, 26), box)
+            pygame.draw.rect(self.screen, (238, 203, 116), box, width=2)
+
+            name_surf = self.font.render(self.player_name + "_", True, (255, 255, 255))
+            self.screen.blit(name_surf, name_surf.get_rect(center=box.center))
+
+            hint = self.small_font.render("Nhấn ENTER để xác nhận", True, (140, 150, 130))
+            self.screen.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, 380)))
+
+            self._draw_cursor()
+            pygame.display.flip()
+            return
+
+        if self.state == "ip_input":
+            self._draw_menu_background()
+            title = self.font.render("VÀO PHÒNG (JOIN LOBBY)", True, (245, 232, 184))
+            self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 200)))
+            prompt = self.small_font.render("Nhập IP của máy chủ (Host):", True, (189, 204, 168))
+            self.screen.blit(prompt, prompt.get_rect(center=(SCREEN_WIDTH // 2, 250)))
+
+            box = pygame.Rect(SCREEN_WIDTH // 2 - 150, 300, 300, 50)
+            pygame.draw.rect(self.screen, (24, 30, 26), box)
+            pygame.draw.rect(self.screen, (238, 203, 116), box, width=2)
+
+            ip_surf = self.font.render(self.host_ip + "_", True, (255, 255, 255))
+            self.screen.blit(ip_surf, ip_surf.get_rect(center=box.center))
+
+            hint = self.small_font.render("Nhấn ENTER để kết nối | ESC để quay lại", True, (140, 150, 130))
+            self.screen.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, 380)))
+
+            self._draw_cursor()
+            pygame.display.flip()
+            return
+
+        if self.state == "lobby":
+            self._draw_menu_background()
+            if getattr(self, "network_mode", "offline") == "host":
+                ip_text = self.big_font.render(f"IP PHÒNG CỦA BẠN: {getattr(self, 'local_ip', '127.0.0.1')}", True, (255, 223, 128))
+                self.screen.blit(ip_text, ip_text.get_rect(center=(SCREEN_WIDTH // 2, 80)))
+                subtitle = self.font.render("Hãy gửi IP này cho bạn bè để họ nhập vào!", True, (189, 204, 168))
+                self.screen.blit(subtitle, subtitle.get_rect(center=(SCREEN_WIDTH // 2, 130)))
+            else:
+                ip_text = self.big_font.render(f"ĐANG TRONG PHÒNG: {self.host_ip}", True, (245, 232, 184))
+                self.screen.blit(ip_text, ip_text.get_rect(center=(SCREEN_WIDTH // 2, 80)))
+
+            # Draw player slots
+            connected_players = []
+            if self.network_client and self.network_client.connected:
+                connected_players = self.network_client.server_state.get("players", [self.player_name])
+            elif self.player_name:
+                connected_players = [self.player_name]
+
+            slot_start_y = 200
+            for i in range(4):
+                rect = pygame.Rect(SCREEN_WIDTH // 2 - 250, slot_start_y + i * 80, 500, 60)
+                self._draw_3d_panel(rect, fill=(15, 21, 18), alpha=200, border=(91, 108, 83), depth=4, radius=4)
+
+                if i < len(connected_players):
+                    name = connected_players[i]
+                    color = (255, 223, 128) if i == 0 else (207, 217, 184)
+                else:
+                    name = "Chỗ trống - chờ người chơi thật" if getattr(self, "network_mode", "offline") == "host" else "Đang chờ..."
+                    color = (140, 150, 130)
+
+                text = self.font.render(name, True, color)
+                self.screen.blit(text, (rect.left + 20, rect.centery - text.get_height() // 2))
+
+            # Draw Controls
+            self.lobby_buttons.clear()
+            mouse_pos = pygame.mouse.get_pos()
+
+            if getattr(self, "network_mode", "offline") == "host":
+                # Host Controls
+                map_rect = pygame.Rect(SCREEN_WIDTH // 2 - 320, 560, 200, 50)
+                shop_rect = pygame.Rect(SCREEN_WIDTH // 2 - 100, 560, 200, 50)
+                start_rect = pygame.Rect(SCREEN_WIDTH // 2 + 120, 560, 200, 50)
+
+                # Choose map
+                hover_map = map_rect.collidepoint(mouse_pos)
+                self._draw_3d_button(map_rect, (45, 58, 50) if hover_map else (35, 48, 40), (87, 103, 78), active=False, depth=4)
+                text = self.font.render("CHỌN MAP", True, (255, 241, 196) if hover_map else (207, 217, 184))
+                self.screen.blit(text, text.get_rect(center=map_rect.center))
+                self.lobby_buttons.append((map_rect, "maps"))
+
+                # Shop
+                hover_shop = shop_rect.collidepoint(mouse_pos)
+                self._draw_3d_button(shop_rect, (45, 58, 50) if hover_shop else (35, 48, 40), (87, 103, 78), active=False, depth=4)
+                text = self.font.render("SHOP", True, (255, 241, 196) if hover_shop else (207, 217, 184))
+                self.screen.blit(text, text.get_rect(center=shop_rect.center))
+                self.lobby_buttons.append((shop_rect, "shop"))
+
+                # Start
+                hover_start = start_rect.collidepoint(mouse_pos)
+                self._draw_3d_button(start_rect, (65, 88, 70) if hover_start else (55, 78, 60), (107, 123, 98), active=False, depth=4)
+                text = self.font.render("BẮT ĐẦU", True, (255, 255, 255) if hover_start else (223, 224, 198))
+                self.screen.blit(text, text.get_rect(center=start_rect.center))
+                self.lobby_buttons.append((start_rect, "start"))
+
+                # Show currently selected map
+                map_title = MAPS.get(self.current_map_id, {}).get("title", "Unknown Map")
+                map_info = self.small_font.render(f"Map hiện tại: {map_title}", True, (189, 204, 168))
+                self.screen.blit(map_info, map_info.get_rect(center=(SCREEN_WIDTH // 2, 530)))
+            else:
+                # Client Controls
+                shop_rect = pygame.Rect(SCREEN_WIDTH // 2 - 220, 560, 200, 50)
+                start_rect = pygame.Rect(SCREEN_WIDTH // 2 + 20, 560, 200, 50)
+
+                # Shop
+                hover_shop = shop_rect.collidepoint(mouse_pos)
+                self._draw_3d_button(shop_rect, (45, 58, 50) if hover_shop else (35, 48, 40), (87, 103, 78), active=False, depth=4)
+                text = self.font.render("SHOP", True, (255, 241, 196) if hover_shop else (207, 217, 184))
+                self.screen.blit(text, text.get_rect(center=shop_rect.center))
+                self.lobby_buttons.append((shop_rect, "shop"))
+
+                # Waiting
+                self._draw_3d_button(start_rect, (35, 48, 40), (87, 103, 78), active=False, depth=4)
+                text = self.font.render("ĐANG CHỜ CHỦ PHÒNG...", True, (140, 150, 130))
+                self.screen.blit(text, text.get_rect(center=start_rect.center))
+
+            hint = self.small_font.render("ESC để rời phòng", True, (140, 150, 130))
+            self.screen.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, 640)))
+
+            self._draw_cursor()
+            pygame.display.flip()
+            return
+
+        if self.state == "pvp_menu":
+            self._draw_menu_background()
+            title = self.big_font.render("CHỌN CHẾ ĐỘ PVP", True, (245, 232, 184))
+            self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 150)))
+
+            options = [
+                ("SOLO VS BOT (DỄ)", "Phù hợp để làm quen. Bot phản xạ chậm và máu giấy."),
+                ("SOLO VS BOT (THƯỜNG)", "Đấu tay đôi công bằng. Chỉ số ngang bằng với bạn."),
+                ("SOLO VS BOT (KHÓ)", "Siêu Bot có khả năng né đạn và ngắm bắn cực chuẩn."),
+                ("ONLINE (2v2)", "Tạo phòng và mời bạn bè tham gia đấu trường 2v2.")
+            ]
+
+            for idx, (label, desc) in enumerate(options):
+                rect = pygame.Rect(SCREEN_WIDTH // 2 - 200, 240 + idx * 70, 400, 50)
+                selected = getattr(self, "pvp_selection", 0) == idx
+                self._draw_3d_button(rect, (129, 70, 48) if selected else (35, 48, 40), (238, 203, 116) if selected else (87, 103, 78), active=selected, depth=4)
+                if selected:
+                    marker = pygame.Rect(rect.left + 8, rect.top + 8, 4, rect.height - 16)
+                    pygame.draw.rect(self.screen, (255, 223, 128), marker, border_radius=2)
+                text = self.font.render(label, True, (255, 241, 196) if selected else (223, 224, 198))
+                self.screen.blit(text, text.get_rect(center=rect.center))
+
+                if selected:
+                    desc_text = self.small_font.render(desc, True, (207, 217, 184))
+                    self.screen.blit(desc_text, desc_text.get_rect(center=(SCREEN_WIDTH // 2, 540)))
+
+            hint = self.small_font.render("Nhấn ENTER để chọn | ESC để quay lại", True, (140, 150, 130))
+            self.screen.blit(hint, hint.get_rect(center=(SCREEN_WIDTH // 2, 600)))
+
+            self._draw_cursor()
+            pygame.display.flip()
+            return
+
         if self.state == "title":
             self.draw_title()
             self._draw_cursor()
@@ -960,7 +2170,7 @@ class Game:
             shell.draw(self.screen, self.camera)
         self._draw_melee_swings()
         self._draw_corpses()
-        actors = [*self.enemies, *self.enemy_vehicles, *self.vehicles, *self.enemy_aircraft]
+        actors = [*self.enemies, *self.enemy_vehicles, *self.vehicles, *self.enemy_aircraft, *getattr(self, "ally_bots", [])]
         if not getattr(self.player, "vehicle", None):
             actors.append(self.player)
         for entity in sorted(actors, key=lambda item: item.rect.centery):
@@ -968,9 +2178,51 @@ class Game:
         self.particles.draw(self.screen, self.camera)
         self._draw_floaters()
         self._draw_objective_pointer()
-        self._draw_ui()
+
+        if self.state == "cutscene":
+            self._draw_cutscene()
+        else:
+            self._draw_ui()
+
         self._draw_cursor()
         pygame.display.flip()
+
+    def _draw_cutscene(self) -> None:
+        chapter = CHAPTERS_BY_MAP.get(self.current_map_id)
+        if not chapter or not getattr(chapter, "dialogues", ()):
+            self.state = "play"
+            return
+
+        # Draw cinematic letterbox
+        bar_height = 80
+        pygame.draw.rect(self.screen, (10, 14, 12), (0, 0, SCREEN_WIDTH, bar_height))
+        pygame.draw.rect(self.screen, (10, 14, 12), (0, SCREEN_HEIGHT - bar_height, SCREEN_WIDTH, bar_height))
+
+        if self.cutscene_index < len(chapter.dialogues):
+            speaker, text = chapter.dialogues[self.cutscene_index]
+
+            # Typewriter effect (reveal ~20 characters per second)
+            reveal_count = int(self.cutscene_timer * 20)
+            displayed_text = text[:reveal_count]
+
+            speaker_color = (238, 203, 116) if speaker != "HQ COMMAND" else (189, 204, 168)
+            speaker_surf = self.font.render(speaker + ":", True, speaker_color)
+            self.screen.blit(speaker_surf, (40, SCREEN_HEIGHT - bar_height + 15))
+
+            text_surf = self.small_font.render(displayed_text, True, (245, 232, 184))
+            self.screen.blit(text_surf, (40 + speaker_surf.get_width() + 10, SCREEN_HEIGHT - bar_height + 18))
+
+            hint_surf = self.font.render("Nhấn SPACE để tiếp tục", True, (80, 100, 80))
+            self.screen.blit(hint_surf, hint_surf.get_rect(bottomright=(SCREEN_WIDTH - 20, SCREEN_HEIGHT - 10)))
+
+            # Auto-advance if fully typed and waited a bit
+            if reveal_count > len(text) + 60: # about 3 seconds after typing finishes
+                self.cutscene_index += 1
+                self.cutscene_timer = 0.0
+                if self.cutscene_index >= len(chapter.dialogues):
+                    self.state = "play"
+        else:
+            self.state = "play"
 
     def _current_objective_target(self) -> tuple[str, pygame.Vector2, tuple[int, int, int]] | None:
         actor_pos = pygame.Vector2(self.active_actor.rect.center)
@@ -1251,6 +2503,17 @@ class Game:
             self.menu_buttons.append((rect, f"map:{map_id}"))
 
         play_rect = pygame.Rect(panel.left + 24, panel.bottom - 70, panel.width - 48, 46)
+
+        if getattr(self, "previous_state", "title") == "lobby":
+            # Shrink play button and add back-to-lobby button
+            play_rect = pygame.Rect(panel.left + 24, panel.bottom - 70, (panel.width - 56) // 2, 46)
+            lobby_rect = pygame.Rect(play_rect.right + 8, panel.bottom - 70, (panel.width - 56) // 2, 46)
+            hot_lobby = lobby_rect.collidepoint(pygame.mouse.get_pos())
+            self._draw_3d_button(lobby_rect, (35, 48, 40) if not hot_lobby else (55, 70, 60), (87, 103, 78), active=True, hot=hot_lobby, depth=6)
+            back_lbl = self.font.render("◀ VỀ PHÒNG CHỜ", True, (255, 240, 190))
+            self.screen.blit(back_lbl, back_lbl.get_rect(center=lobby_rect.center))
+            self.menu_buttons.append((lobby_rect, "back_lobby"))
+
         self._draw_3d_button(
             play_rect,
             (153, 61, 48),
@@ -1259,7 +2522,8 @@ class Game:
             hot=play_rect.collidepoint(pygame.mouse.get_pos()),
             depth=6,
         )
-        play = self.font.render("START MISSION", True, (255, 240, 190))
+        play_label = "BẮT ĐẦU" if getattr(self, "previous_state", "title") == "lobby" else "START MISSION"
+        play = self.font.render(play_label, True, (255, 240, 190))
         self.screen.blit(play, play.get_rect(center=play_rect.center))
         self.menu_buttons.append((play_rect, "play"))
 
@@ -1359,7 +2623,7 @@ class Game:
     def _draw_shop_panel(self, panel: pygame.Rect) -> None:
         credits = self.font.render(f"Credits: {self.campaign.credits}", True, (238, 203, 116))
         self.screen.blit(credits, (panel.left + 28, panel.top + 24))
-        equipped = self.small_font.render(f"Eq: {weapon_name(self.equipped_primary)} / {weapon_name(self.equipped_sidearm)}", True, (189, 204, 168))
+        equipped = self.small_font.render(f"Đang dùng: {weapon_name(self.equipped_primary)} / {weapon_name(self.equipped_sidearm)}", True, (189, 204, 168))
         self.screen.blit(equipped, (panel.left + 28, panel.top + 50))
         self._draw_shop_filters(panel)
 
@@ -1393,32 +2657,38 @@ class Game:
                 pygame.draw.rect(self.screen, (238, 203, 116), pygame.Rect(rect.left + 6, rect.top + 8, 4, rect.height - 16), border_radius=2)
             elif rect.collidepoint(pygame.mouse.get_pos()):
                 pygame.draw.rect(self.screen, (189, 204, 168), pygame.Rect(rect.left + 6, rect.top + 10, 3, rect.height - 20), border_radius=2)
-            price = "OWNED" if owned and item.max_purchases == 1 else ("MAX" if maxed else f"{item.cost}c")
+
+            price = "SỞ HỮU" if owned and item.max_purchases == 1 else ("TỐI ĐA" if maxed else f"{item.cost}c")
             icon = self._shop_icon(item_id)
             if icon is not None:
                 self.screen.blit(icon, icon.get_rect(center=(rect.left + 27, rect.centery)))
                 text_x = rect.left + 50
             else:
                 text_x = rect.left + 16
+
             level = f" Lv {bought_count}/{item.max_purchases}" if item.max_purchases and item.max_purchases > 1 else ""
-            name = self.small_font.render(self._fit_text(f"{item.name}{level} - {price}", self.small_font, rect.right - text_x - 8), True, (245, 232, 184))
+            name_text = f"{item.name}{level} - {price}"
+            if not can_buy and not owned:
+                name_text = f"[KHOÁ] {name_text}"
+
+            name = self.small_font.render(self._fit_text(name_text, self.small_font, rect.right - text_x - 8), True, (245, 232, 184) if can_buy or owned else (140, 140, 130))
             desc = self.small_font.render(self._fit_text(self._shop_description(item_id, item.description), self.small_font, rect.right - text_x - 8), True, (200, 207, 180))
             self.screen.blit(name, (text_x, rect.top + 4))
             self.screen.blit(desc, (text_x, rect.top + 28))
             self.menu_buttons.append((rect, f"equip:{item_id}" if owned and item.kind == "weapon" else f"buy:{item_id}"))
 
         nav_y = panel.bottom - 44
-        page_label = self.small_font.render(f"Page {self.shop_page + 1}/{pages}", True, (238, 203, 116))
+        page_label = self.small_font.render(f"Trang {self.shop_page + 1}/{pages}", True, (238, 203, 116))
         self.screen.blit(page_label, page_label.get_rect(center=(panel.centerx, nav_y + 16)))
         if self.shop_page > 0:
             prev_rect = pygame.Rect(panel.left + 24, nav_y, 86, 32)
             self._draw_3d_button(prev_rect, (35, 48, 40), (226, 196, 82), hot=prev_rect.collidepoint(pygame.mouse.get_pos()), depth=4)
-            self.screen.blit(self.small_font.render("< Prev", True, (245, 232, 184)), (prev_rect.left + 15, prev_rect.top + 7))
+            self.screen.blit(self.small_font.render("< Trước", True, (245, 232, 184)), (prev_rect.left + 15, prev_rect.top + 7))
             self.menu_buttons.append((prev_rect, f"shop_page:{self.shop_page - 1}"))
         if self.shop_page < pages - 1:
             next_rect = pygame.Rect(panel.right - 110, nav_y, 86, 32)
             self._draw_3d_button(next_rect, (35, 48, 40), (226, 196, 82), hot=next_rect.collidepoint(pygame.mouse.get_pos()), depth=4)
-            self.screen.blit(self.small_font.render("Next >", True, (245, 232, 184)), (next_rect.left + 14, next_rect.top + 7))
+            self.screen.blit(self.small_font.render("Tiếp >", True, (245, 232, 184)), (next_rect.left + 14, next_rect.top + 7))
             self.menu_buttons.append((next_rect, f"shop_page:{self.shop_page + 1}"))
 
     def _draw_shop_filters(self, panel: pygame.Rect) -> None:
@@ -1575,25 +2845,34 @@ class Game:
         depth: int = 4,
         radius: int = 6,
     ) -> None:
-        lift = 1 if hot else 0
+        pressed = hot and pygame.mouse.get_pressed()[0]
+        actual_depth = 1 if pressed else depth
+        lift = -(depth - 1) if pressed else (2 if hot else 0)
         body = rect.move(0, -lift)
-        shadow = pygame.Surface((body.width, body.height + depth), pygame.SRCALPHA)
-        pygame.draw.rect(shadow, (0, 0, 0, 92), pygame.Rect(0, depth, body.width, body.height), border_radius=radius)
+
+        shadow = pygame.Surface((body.width, body.height + actual_depth), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (0, 0, 0, 110), pygame.Rect(0, actual_depth, body.width, body.height), border_radius=radius)
         self.screen.blit(shadow, body)
 
         if active or hot:
-            pulse = 28 + int(18 * math.sin(pygame.time.get_ticks() / 180))
-            glow = pygame.Surface(body.inflate(12, 12).size, pygame.SRCALPHA)
-            pygame.draw.rect(glow, (*border, pulse if active else 24), glow.get_rect(), border_radius=radius + 4)
-            self.screen.blit(glow, body.inflate(12, 12))
+            pulse = 35 + int(20 * math.sin(pygame.time.get_ticks() / 150))
+            glow = pygame.Surface(body.inflate(16, 16).size, pygame.SRCALPHA)
+            pygame.draw.rect(glow, (*border, pulse if active else 30), glow.get_rect(), border_radius=radius + 4)
+            self.screen.blit(glow, body.inflate(16, 16))
 
-        top = tuple(min(255, c + (28 if active or hot else 16)) for c in fill)
-        bottom = tuple(max(0, c - 28) for c in fill)
-        pygame.draw.rect(self.screen, bottom, body.move(0, depth), border_radius=radius)
+        top = tuple(min(255, c + (35 if active or hot else 20)) for c in fill)
+        bottom = tuple(max(0, c - 35) for c in fill)
+        pygame.draw.rect(self.screen, bottom, body.move(0, actual_depth), border_radius=radius)
         pygame.draw.rect(self.screen, fill, body, border_radius=radius)
-        pygame.draw.rect(self.screen, top, body.inflate(-8, -body.height // 2).move(0, 4), border_radius=max(2, radius - 2))
-        pygame.draw.line(self.screen, tuple(min(255, c + 55) for c in fill), (body.left + 8, body.top + 3), (body.right - 8, body.top + 3), 1)
-        pygame.draw.line(self.screen, tuple(max(0, c - 46) for c in fill), (body.left + 8, body.bottom - 2), (body.right - 8, body.bottom - 2), 2)
+
+        # Glassy highlight
+        highlight_rect = body.inflate(-8, -body.height // 2).move(0, 4)
+        highlight = pygame.Surface(highlight_rect.size, pygame.SRCALPHA)
+        pygame.draw.rect(highlight, (*top, 140), highlight.get_rect(), border_radius=max(2, radius - 2))
+        self.screen.blit(highlight, highlight_rect)
+
+        pygame.draw.line(self.screen, tuple(min(255, c + 65) for c in fill), (body.left + 8, body.top + 2), (body.right - 8, body.top + 2), 1)
+        pygame.draw.line(self.screen, tuple(max(0, c - 55) for c in fill), (body.left + 8, body.bottom - 2), (body.right - 8, body.bottom - 2), 2)
         pygame.draw.rect(self.screen, border, body, 2 if active else 1, border_radius=radius)
 
     def _draw_3d_panel(
@@ -1601,23 +2880,28 @@ class Game:
         rect: pygame.Rect,
         *,
         fill: tuple[int, int, int] = (16, 21, 18),
-        alpha: int = 178,
+        alpha: int = 190,
         border: tuple[int, int, int] = (78, 92, 73),
-        depth: int = 5,
-        radius: int = 6,
+        depth: int = 6,
+        radius: int = 8,
     ) -> None:
-        shadow = pygame.Surface((rect.width + 10, rect.height + depth + 10), pygame.SRCALPHA)
-        pygame.draw.rect(shadow, (0, 0, 0, 92), pygame.Rect(5, depth + 5, rect.width, rect.height), border_radius=radius)
-        self.screen.blit(shadow, (rect.left - 5, rect.top - 5))
+        shadow = pygame.Surface((rect.width + 12, rect.height + depth + 12), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (0, 0, 0, 120), pygame.Rect(6, depth + 6, rect.width, rect.height), border_radius=radius)
+        self.screen.blit(shadow, (rect.left - 6, rect.top - 6))
+
         bg = pygame.Surface(rect.size, pygame.SRCALPHA)
         pygame.draw.rect(bg, (*fill, alpha), bg.get_rect(), border_radius=radius)
+        # Inner glow / Glass effect
+        pygame.draw.rect(bg, (*tuple(min(255, c + 40) for c in fill), 30), bg.get_rect(), border_radius=radius)
         self.screen.blit(bg, rect)
-        highlight = pygame.Rect(rect.left + 4, rect.top + 3, rect.width - 8, max(5, rect.height // 4))
+
+        highlight = pygame.Rect(rect.left + 4, rect.top + 3, rect.width - 8, max(5, rect.height // 3))
         hi = pygame.Surface(highlight.size, pygame.SRCALPHA)
-        pygame.draw.rect(hi, (255, 255, 220, 22), hi.get_rect(), border_radius=max(2, radius - 2))
+        pygame.draw.rect(hi, (255, 255, 230, 25), hi.get_rect(), border_radius=max(2, radius - 2))
         self.screen.blit(hi, highlight)
-        pygame.draw.line(self.screen, tuple(min(255, c + 35) for c in border), (rect.left + 8, rect.top + 2), (rect.right - 8, rect.top + 2), 1)
-        pygame.draw.line(self.screen, tuple(max(0, c - 42) for c in border), (rect.left + 8, rect.bottom - 2), (rect.right - 8, rect.bottom - 2), 2)
+
+        pygame.draw.line(self.screen, tuple(min(255, c + 45) for c in border), (rect.left + 8, rect.top + 2), (rect.right - 8, rect.top + 2), 1)
+        pygame.draw.line(self.screen, tuple(max(0, c - 50) for c in border), (rect.left + 8, rect.bottom - 2), (rect.right - 8, rect.bottom - 2), 2)
         pygame.draw.rect(self.screen, border, rect, 1, border_radius=radius)
 
     def _panel(self, rect: pygame.Rect) -> None:
@@ -1778,9 +3062,21 @@ class Game:
         self._draw_minimap()
         self._draw_radio_log()
         self._draw_action_bar(mortar)
-        vehicle_hint = "E: enter/exit tank   " if self.vehicles else ""
-        door_hint = "E: open safe-room gate   " if not self.tilemap.doors_open else ""
-        objective = "Open the gate to begin" if not self.mission_started else "Clear hostiles, then hold command"
+
+        if getattr(self, "boss_vehicle", None) and self.boss_vehicle.alive:
+            bar_w = 400
+            bar_h = 24
+            bar_rect = pygame.Rect((SCREEN_WIDTH - bar_w) // 2, 40, bar_w, bar_h)
+            pygame.draw.rect(self.screen, (35, 30, 28), bar_rect, border_radius=4)
+            pygame.draw.rect(self.screen, (78, 92, 73), bar_rect, 2, border_radius=4)
+            fill_w = int(bar_w * max(0, self.boss_vehicle.hp) / self.boss_vehicle.max_hp)
+            if fill_w > 0:
+                pygame.draw.rect(self.screen, (220, 70, 54), pygame.Rect(bar_rect.left, bar_rect.top, fill_w, bar_h), border_radius=4)
+            title = self.font.render("SIÊU TĂNG HẠNG NẶNG (BOSS)", True, (255, 184, 150))
+            self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 25)))
+        vehicle_hint = "E: lên/xuống xe   " if self.vehicles else ""
+        door_hint = "E: mở cổng an toàn   " if not self.tilemap.doors_open else ""
+        objective = "Mở cổng để bắt đầu" if not self.mission_started else "Tiêu diệt địch và chiếm cứ điểm"
         hint = f"{door_hint}{vehicle_hint}{objective}".strip()
         if hint:
             self._draw_bottom_hint(hint)
@@ -2003,7 +3299,7 @@ class Game:
         overlay = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 190))
         self.screen.blit(overlay, (0, 0))
-        
+
         # Increase height of panel slightly to fit 5 buttons elegantly if next_map is available
         panel_h = 360
         panel = pygame.Rect(SCREEN_WIDTH // 2 - 270, SCREEN_HEIGHT // 2 - panel_h // 2, 540, panel_h)
@@ -2035,7 +3331,7 @@ class Game:
             next_idx = current_idx + 1
             if next_idx < len(self.map_ids):
                 actions.append(("next_map", "SANG MÀN TIẾP"))
-        
+
         actions.extend([
             ("retry", "RETRY"),
             ("maps", "CHỌN MAP"),
@@ -2048,11 +3344,11 @@ class Game:
         btn_spacing = 34
         for index, (action, label_text) in enumerate(actions):
             rect = pygame.Rect(panel.left + 66, panel.top + 145 + index * btn_spacing, panel.width - 132, btn_h)
-            
+
             # Custom primary flag: true for next_map, or maps (if next_map not available on victory)
             primary = (action == "next_map") or (action == "maps" and self.result == "VICTORY" and not any(a[0] == "next_map" for a in actions))
             hot = rect.collidepoint(pygame.mouse.get_pos())
-            
+
             # Premium green fill (45, 110, 54) for primary button, and classic (35, 48, 40) for others
             fill = (45, 110, 54) if primary else (35, 48, 40)
             self._draw_3d_button(

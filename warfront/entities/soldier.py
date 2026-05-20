@@ -22,16 +22,23 @@ def move_with_collision(rect: pygame.Rect, delta: pygame.Vector2, tilemap) -> py
 
 
 class Soldier:
-    def __init__(self, pos, is_player=False, tank=False):
+    def __init__(self, pos, is_player=False, tank=False, team=None, bot_name=None, difficulty="normal"):
         self.is_player = is_player
+        self.bot_name = bot_name
+        self.team = team if team else ("player" if is_player else "enemy")
         self.tank = tank
         self.unit_kind = "player" if is_player else ("light_tank" if tank else "rifleman")
         self.stats = UNIT_STATS[self.unit_kind]
         self.rect = pygame.Rect(pos[0], pos[1], 32 if not tank else 46, 36 if not tank else 42)
-        self.hp = self.stats.hp
+        
+        self.difficulty = difficulty
+        hp_mult = 0.6 if difficulty == "easy" else (1.5 if difficulty == "hard" else 1.0)
+        dmg_mult = 0.5 if difficulty == "easy" else (1.3 if difficulty == "hard" else 1.0)
+        
+        self.hp = int(self.stats.hp * hp_mult)
         self.max_hp = self.hp
         self.armor = self.stats.armor
-        self.damage_amount = self.stats.damage
+        self.damage_amount = int(self.stats.damage * dmg_mult)
         self.weapon_range = self.stats.range
         self.speed = self.stats.speed
         self.reload = 0.0
@@ -48,6 +55,7 @@ class Soldier:
         self.melee_flash = 0.0
         self.weapon_pose = "rifle"
         self.dead_time = 0.0
+        self.player_controlled = False  # True when a network client is driving this bot
 
     @property
     def alive(self) -> bool:
@@ -91,7 +99,18 @@ class Soldier:
             self.angle = self.aim_angle
         self._tick_timers(dt)
 
-    def update_enemy(self, dt: float, player, tilemap, path: list[tuple[int, int]] | None = None) -> list[Bullet]:
+    def get_nearest_target(self, targets: list):
+        nearest = None
+        min_dist = float('inf')
+        for t in targets:
+            if t.alive:
+                dist = pygame.Vector2(self.rect.center).distance_to(t.rect.center)
+                if dist < min_dist:
+                    min_dist = dist
+                    nearest = t
+        return nearest, min_dist
+
+    def update_bot(self, dt: float, enemies: list, follow_target, tilemap, path: list[tuple[int, int]] | None = None) -> list[Bullet]:
         bullets: list[Bullet] = []
         if not self.alive:
             self.moving = False
@@ -99,26 +118,78 @@ class Soldier:
             return bullets
 
         self.think_time -= dt
-        to_player = pygame.Vector2(player.rect.center) - pygame.Vector2(self.rect.center)
-        distance = to_player.length()
-        has_los = tilemap.has_line_of_sight(self.rect.center, player.rect.center)
 
-        if distance < 520 and (not has_los or distance > self.weapon_range * 0.72) and path and len(path) > 1:
-            target_index = 1
-            current_tile_center = tilemap.tile_center(path[target_index])
-            if pygame.Vector2(self.rect.center).distance_to(current_tile_center) < 10 and len(path) > 2:
-                target_index = 2
-            step = tilemap.tile_center(path[target_index]) - pygame.Vector2(self.rect.center)
-            self.wander = step.normalize() if step.length_squared() else pygame.Vector2()
-        elif has_los and distance < self.weapon_range * 0.85:
-            self.wander = pygame.Vector2()
-        elif self.think_time <= 0:
-            self.think_time = random.uniform(0.4, 1.0)
-            if distance < 520:
+        if not getattr(self, "player_controlled", False):
+            # ── Normal AI movement logic ──────────────────────────────────────
+            target, distance = self.get_nearest_target(enemies)
+            
+            has_los = False
+            to_target = pygame.Vector2()
+            if target:
+                to_target = pygame.Vector2(target.rect.center) - pygame.Vector2(self.rect.center)
+                has_los = tilemap.has_line_of_sight(self.rect.center, target.rect.center)
+                
+            follow_dist = float('inf')
+            if follow_target and follow_target.alive:
+                follow_dist = pygame.Vector2(self.rect.center).distance_to(follow_target.rect.center)
+
+            # Movement logic
+            if getattr(self, "difficulty", "normal") == "hard" and target and has_los and distance < 450:
+                if self.think_time <= 0:
+                    self.think_time = random.uniform(0.3, 0.7)
+                    dodge_dir = random.choice([-1, 1])
+                    perp = pygame.Vector2(-to_target.y, to_target.x).normalize()
+                    self.wander = (perp * dodge_dir + to_target.normalize() * random.uniform(-0.4, 0.2)).normalize()
+            elif target and distance < 520 and (not has_los or distance > self.weapon_range * 0.72) and path and len(path) > 1:
+                target_index = 1
+                current_tile_center = tilemap.tile_center(path[target_index])
+                if pygame.Vector2(self.rect.center).distance_to(current_tile_center) < 10 and len(path) > 2:
+                    target_index = 2
+                step = tilemap.tile_center(path[target_index]) - pygame.Vector2(self.rect.center)
+                self.wander = step.normalize() if step.length_squared() else pygame.Vector2()
+            elif target and has_los and distance < self.weapon_range * 0.85 and getattr(self, "difficulty", "normal") != "hard":
                 self.wander = pygame.Vector2()
-            else:
-                self.wander = pygame.Vector2(random.uniform(-1, 1), random.uniform(-1, 1))
+            elif follow_target and follow_dist > 150:
+                step = pygame.Vector2(follow_target.rect.center) - pygame.Vector2(self.rect.center)
+                self.wander = step.normalize() if step.length_squared() else pygame.Vector2()
+            elif self.think_time <= 0:
+                self.think_time = random.uniform(0.4, 1.0)
+                if target and distance < 520:
+                    self.wander = pygame.Vector2()
+                else:
+                    self.wander = pygame.Vector2(random.uniform(-1, 1), random.uniform(-1, 1))
 
+            # Aim logic
+            if target and distance < 600:
+                target_angle = math.degrees(math.atan2(to_target.y, to_target.x))
+                diff = (target_angle - self.aim_angle + 180) % 360 - 180
+                
+                diff_level = getattr(self, "difficulty", "normal")
+                aim_speed = 720 * dt if diff_level == "hard" else (270 * dt if diff_level == "normal" else 120 * dt)
+                
+                if abs(diff) <= aim_speed:
+                    self.aim_angle = target_angle
+                else:
+                    self.aim_angle += aim_speed if diff > 0 else -aim_speed
+            elif self.moving:
+                self.aim_angle = self.move_angle
+
+            # Shoot logic (AI)
+            if target and has_los and distance < self.weapon_range and self.reload <= 0:
+                self.reload = 1.2 if self.tank else 0.85
+                if distance:
+                    self.angle = self.aim_angle
+                self.shooting_flash = 0.12
+                friendly = self.team == "player"
+                bullets.append(Bullet(self.rect.center, to_target, friendly=friendly, damage=self.damage_amount))
+        else:
+            # ── Player-controlled: AI replaced by network input ───────────────
+            # wander and aim_angle are already set by _sync_host from client input
+            target = None
+            has_los = False
+            to_target = pygame.Vector2()
+
+        # ── Shared: physics movement ──────────────────────────────────────────
         speed = self.speed
         self.moving = False
         if self.wander.length_squared():
@@ -127,22 +198,21 @@ class Soldier:
             self.rect = move_with_collision(self.rect, self.wander.normalize() * speed * dt, tilemap)
             self.moving = self.rect.topleft != before
 
-        if distance:
-            self.aim_angle = math.degrees(math.atan2(to_player.y, to_player.x))
-        if self.shooting_flash > 0:
+        if self.shooting_flash > 0 or self.melee_flash > 0:
             self.angle = self.aim_angle
         elif self.moving:
             self.angle = self.move_angle
-        elif distance and has_los:
+        elif getattr(self, "player_controlled", False):
             self.angle = self.aim_angle
+        elif not getattr(self, "player_controlled", False) and target and has_los:
+            self.angle = self.aim_angle
+            
         self._tick_timers(dt)
-        if has_los and distance < self.weapon_range and self.reload <= 0:
-            self.reload = 1.2 if self.tank else 0.85
-            if distance:
-                self.angle = self.aim_angle
-            self.shooting_flash = 0.12
-            bullets.append(Bullet(self.rect.center, to_player, friendly=False, damage=self.damage_amount))
         return bullets
+
+    def update_enemy(self, dt: float, player, tilemap, path: list[tuple[int, int]] | None = None) -> list[Bullet]:
+        """Legacy wrapper: enemies target the player directly."""
+        return self.update_bot(dt, [player], follow_target=None, tilemap=tilemap, path=path)
 
     def shoot(self, target) -> Bullet | None:
         if self.reload > 0 or self.melee_flash > 0 or not self.alive:
@@ -184,7 +254,17 @@ class Soldier:
         hp_rect = pygame.Rect(view.centerx - hp_w // 2, sprite_rect.top - 8, hp_w, 5)
         pygame.draw.rect(screen, (35, 30, 28), hp_rect)
         hp_rect.width = int(hp_w * max(0, self.hp) / self.max_hp)
-        pygame.draw.rect(screen, (77, 176, 88) if self.is_player else (204, 73, 57), hp_rect)
+        pygame.draw.rect(screen, (77, 176, 88) if self.team == "player" else (204, 73, 57), hp_rect)
+        
+        if getattr(self, "bot_name", None):
+            font = pygame.font.SysFont("consolas", 12)
+            name_text = font.render(self.bot_name, True, (245, 232, 184))
+            name_rect = name_text.get_rect(center=(view.centerx, sprite_rect.top - 16))
+            
+            # Simple shadow for text
+            shadow_text = font.render(self.bot_name, True, (20, 20, 18))
+            screen.blit(shadow_text, (name_rect.x + 1, name_rect.y + 1))
+            screen.blit(name_text, name_rect)
 
     def _current_sprite(self) -> pygame.Surface:
         assets = get_assets()
@@ -194,7 +274,7 @@ class Soldier:
             sprite = assets.frame("m4_sherman", frame, 70)
             return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 3 else sprite
 
-        group = "allied_soldier" if self.is_player else "axis_soldier"
+        group = "allied_soldier" if self.team == "player" else "axis_soldier"
         state, indices = self._soldier_animation()
         if state != self.anim_state:
             self.anim_state = state
@@ -235,7 +315,7 @@ class Soldier:
 
     def _soldier_animation(self) -> tuple[str, list[int]]:
         direction = self._direction_name()
-        faction = "allied" if self.is_player else "axis"
+        faction = "allied" if self.team == "player" else "axis"
         if not self.alive:
             return "downed", get_soldier_frames(faction, "downed")
         if self.melee_flash > 0:
@@ -244,9 +324,9 @@ class Soldier:
             return f"shoot_{direction}", get_soldier_frames(faction, "shoot", direction)
         if self.moving:
             return f"run_{direction}", get_soldier_frames(faction, "run", direction)
-        if self.is_player and self.weapon_pose in {"rifle", "sniper"}:
+        if self.team == "player" and self.weapon_pose in {"rifle", "sniper"}:
             return f"ready_{direction}", get_soldier_frames(faction, "rifle", direction)
-        if self.is_player and self.weapon_pose == "pistol":
+        if self.team == "player" and self.weapon_pose == "pistol":
             return f"pistol_{direction}", get_soldier_frames(faction, "utility", direction)
         return f"idle_{direction}", get_soldier_frames(faction, "idle", direction)
 

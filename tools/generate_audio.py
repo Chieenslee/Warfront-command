@@ -191,57 +191,45 @@ def battlefield_loop() -> list[float]:
     return fade(render(duration, sample), attack=0.25, release=0.55)
 
 
+def _chord(t: float, root: float, is_minor: bool) -> float:
+    # A soft string-like pad
+    c = sine(root, t) * 0.4
+    c += sine(root * (1.189 if is_minor else 1.259), t) * 0.3 # Minor 3rd or Major 3rd
+    c += sine(root * 1.498, t) * 0.3 # Perfect 5th
+    # Add a slow swell
+    swell = 0.5 + 0.5 * sine(0.5, t)
+    return c * swell * 0.2
+
 def jungle_outpost_loop() -> list[float]:
-    rng = random.Random(91)
-    duration = 8.0
-
+    # Soft mysterious ambient
+    duration = 16.0
     def sample(t: float) -> float:
-        pulse = sine(65.0, t) * (0.4 + 0.3 * sine(2.0, t))
-        distant = rng.uniform(-1.0, 1.0) * 0.08 * (0.3 + 0.7 * max(0.0, sine(0.3, t)))
-        shimmer = sine(120.0 + 30.0 * sine(1.5, t), t) * 0.06
-        return 0.16 * pulse + distant + shimmer
-
-    return fade(render(duration, sample), attack=0.25, release=0.55)
-
+        # F minor
+        return _chord(t, 87.31, True) + sine(43.65, t) * 0.15
+    return fade(render(duration, sample), attack=0.5, release=0.5)
 
 def trench_line_loop() -> list[float]:
-    rng = random.Random(105)
-    duration = 8.0
-
+    duration = 16.0
     def sample(t: float) -> float:
-        pulse = square(45.0, t) * 0.04 * (0.5 + 0.5 * sine(0.25, t))
-        distant = rng.uniform(-1.0, 1.0) * 0.15
-        low = sine(70.0, t) * 0.14
-        return pulse + distant + low
-
-    return fade(render(duration, sample), attack=0.25, release=0.55)
-
+        # C minor
+        return _chord(t, 65.41, True) + sine(32.70, t) * 0.15
+    return fade(render(duration, sample), attack=0.5, release=0.5)
 
 def river_bridge_loop() -> list[float]:
-    rng = random.Random(119)
-    duration = 8.0
-
+    duration = 16.0
     def sample(t: float) -> float:
-        pulse = sine(80.0, t) * 0.12 * (0.6 + 0.4 * sine(0.8, t))
-        distant = rng.uniform(-1.0, 1.0) * 0.09 * (0.5 + 0.5 * sine(0.12, t))
-        flowing = sine(150.0, t) * 0.08 * (0.5 + 0.5 * sine(4.0, t))
-        return pulse + distant + flowing
-
-    return fade(render(duration, sample), attack=0.25, release=0.55)
-
+        # D minor
+        return _chord(t, 73.42, True) + sine(36.71, t) * 0.15
+    return fade(render(duration, sample), attack=0.5, release=0.5)
 
 def armored_front_loop() -> list[float]:
-    rng = random.Random(133)
-    duration = 8.0
-
+    # Epic deep boss theme
+    duration = 16.0
     def sample(t: float) -> float:
-        clank = square(90.0, t) * 0.05 * math.exp(-(t % 1.0) * 8.0)
-        distant = rng.uniform(-1.0, 1.0) * 0.12
-        low = sine(60.0, t) * 0.18
-        return clank + distant + low
-
-    return fade(render(duration, sample), attack=0.25, release=0.55)
-
+        # E minor with deep drum
+        drum = math.exp(-(t % 0.5) * 10.0) * sine(50.0, t) * 0.3
+        return _chord(t, 82.41, True) + sine(41.20, t) * 0.15 + drum
+    return fade(render(duration, sample), attack=0.5, release=0.5)
 
 SOUNDS = {
     "rifle.wav": rifle,
@@ -255,7 +243,6 @@ SOUNDS = {
     "capture.wav": capture,
 }
 
-
 def main() -> int:
     for filename, maker in SOUNDS.items():
         path = SFX_DIR / filename
@@ -264,7 +251,6 @@ def main() -> int:
 
     # Write music loops
     loops = {
-        "battlefield_loop.wav": battlefield_loop,
         "jungle_outpost.wav": jungle_outpost_loop,
         "trench_line.wav": trench_line_loop,
         "river_bridge.wav": river_bridge_loop,
@@ -275,7 +261,6 @@ def main() -> int:
         write_wav(music_path, maker())
         print(f"Wrote {music_path.relative_to(ROOT)}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

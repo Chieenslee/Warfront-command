@@ -33,6 +33,9 @@ class Camera:
     def apply(self, rect: pygame.Rect) -> pygame.Rect:
         return rect.move(-int(self.offset.x), -int(self.offset.y))
 
+    def apply_pos(self, pos: pygame.Vector2 | tuple[float, float]) -> pygame.Vector2:
+        return pygame.Vector2(pos) - self.offset
+
     def world_mouse(self, mouse_pos: tuple[int, int]) -> pygame.Vector2:
         return pygame.Vector2(mouse_pos) + self.offset
 
