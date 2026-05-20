@@ -1,0 +1,2 @@
+"""Warfront Command package."""
+

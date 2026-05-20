@@ -1,0 +1,2 @@
+"""Packaged game assets."""
+

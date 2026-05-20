@@ -1,0 +1,132 @@
+{
+  "source_dir": "D:\\My\\Games\\TN",
+  "generated_by": "tools/catalog_tn_assets.py",
+  "sheets": [
+    {
+      "index": 0,
+      "role": "operations_menu",
+      "description": "Operations/map selection menu concept",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_hvt885hvt885hvt8.png",
+      "width": 2722,
+      "height": 1568,
+      "copy": "source_sheets/tn_imported/tn_sheet_00_Gemini_Generated_Image_hvt885hvt885hvt8.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 1,
+      "role": "main_menu_shop_weapons",
+      "description": "Main menu, shop UI, weapon cards, item/action fragments",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_xslzrdxslzrdxslz.png",
+      "width": 1622,
+      "height": 2624,
+      "copy": "source_sheets/tn_imported/tn_sheet_01_Gemini_Generated_Image_xslzrdxslzrdxslz.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 2,
+      "role": "shop_weapons",
+      "description": "Weapon shop UI and weapon/item fragments",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_ffo9qrffo9qrffo9.png",
+      "width": 1622,
+      "height": 2624,
+      "copy": "source_sheets/tn_imported/tn_sheet_02_Gemini_Generated_Image_ffo9qrffo9qrffo9.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 3,
+      "role": "shop_weapons_compact",
+      "description": "Compact/cropped weapon shop and item fragments",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_rtefilrtefilrtef.png",
+      "width": 811,
+      "height": 1312,
+      "copy": "source_sheets/tn_imported/tn_sheet_03_Gemini_Generated_Image_rtefilrtefilrtef.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 4,
+      "role": "character_tools",
+      "description": "Character actions with tools and melee weapons",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_k1vi9zk1vi9zk1vi.png",
+      "width": 1620,
+      "height": 2624,
+      "copy": "source_sheets/tn_imported/tn_sheet_04_Gemini_Generated_Image_k1vi9zk1vi9zk1vi.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 5,
+      "role": "character_weapons_a",
+      "description": "Character actions with firearms set A",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_h83n6xh83n6xh83n.png",
+      "width": 1620,
+      "height": 2624,
+      "copy": "source_sheets/tn_imported/tn_sheet_05_Gemini_Generated_Image_h83n6xh83n6xh83n.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 6,
+      "role": "character_weapons_b",
+      "description": "Character actions with firearms set B",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_356ft9356ft9356f.png",
+      "width": 1620,
+      "height": 2624,
+      "copy": "source_sheets/tn_imported/tn_sheet_06_Gemini_Generated_Image_356ft9356ft9356f.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 7,
+      "role": "weapon_catalog_actions",
+      "description": "Weapon names, long guns, and action examples",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_34itat34itat34it.png",
+      "width": 1620,
+      "height": 2624,
+      "copy": "source_sheets/tn_imported/tn_sheet_07_Gemini_Generated_Image_34itat34itat34it.png",
+      "status": "cataloged_needs_precise_cropping"
+    },
+    {
+      "index": 8,
+      "role": "character_weapons_c",
+      "description": "Additional character weapon/action rows",
+      "source": "D:\\My\\Games\\TN\\Gemini_Generated_Image_vng6gyvng6gyvng6.png",
+      "width": 1620,
+      "height": 2624,
+      "copy": "source_sheets/tn_imported/tn_sheet_08_Gemini_Generated_Image_vng6gyvng6gyvng6.png",
+      "status": "cataloged_needs_precise_cropping"
+    }
+  ],
+  "ui_targets": {
+    "title": "main_menu_shop_weapons",
+    "operations": "operations_menu",
+    "shop": "shop_weapons"
+  },
+  "weapon_candidates": [
+    "ak47",
+    "ak74",
+    "stv_380",
+    "svd",
+    "mosin",
+    "vss",
+    "tokarev",
+    "makarov",
+    "pickaxe",
+    "grenade",
+    "mortar",
+    "tank_cannon"
+  ],
+  "animation_groups_needed": [
+    "rifle_idle",
+    "rifle_walk",
+    "rifle_fire",
+    "pistol_idle",
+    "pistol_walk",
+    "pistol_fire",
+    "sniper_idle",
+    "sniper_walk",
+    "sniper_fire",
+    "pickaxe_idle",
+    "pickaxe_walk",
+    "pickaxe_attack",
+    "grenade_throw",
+    "death"
+  ],
+  "next_step": "Open tn_asset_catalog.png, record exact crop rectangles, then promote entries from candidates to cut sprites."
+}
