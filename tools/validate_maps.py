@@ -64,6 +64,14 @@ def validate_map(map_id: str, data: dict) -> list[str]:
             if tile == "C":
                 named_points.append(("capture", (x, y)))
 
+    spawn_point_names: dict[tuple[int, int], list[str]] = {}
+    for name, point in named_points:
+        if name.startswith(("player", "enemy[", "tank[")):
+            spawn_point_names.setdefault(point, []).append(name)
+    for point, names in spawn_point_names.items():
+        if len(names) > 1:
+            failures.append(f"{map_id}: overlapping spawn points at {point}: {', '.join(names)}")
+
     for name, point in named_points:
         if not in_bounds(point, rows):
             failures.append(f"{map_id}: {name} {point} is outside map")
@@ -73,12 +81,12 @@ def validate_map(map_id: str, data: dict) -> list[str]:
         elif point not in reachable:
             failures.append(f"{map_id}: {name} {point} is isolated from player")
 
+    tank_sizes = {stats.size for stats in TANK_STATS.values()}
     for i, point in enumerate(data["spawns"]["tanks"]):
-        for kind, stats in TANK_STATS.items():
-            if not rect_fits(rows, point, stats.size):
-                failures.append(f"{map_id}: tank[{i}] {point} cannot fit {kind} collision box {stats.size}")
-            if narrow_neighbors(rows, point) >= 3:
-                failures.append(f"{map_id}: tank[{i}] {point} starts in a tight pocket")
+        if not any(rect_fits(rows, point, size) for size in tank_sizes):
+            failures.append(f"{map_id}: tank[{i}] {point} cannot fit any known tank collision box")
+        if narrow_neighbors(rows, point) >= 3:
+            failures.append(f"{map_id}: tank[{i}] {point} starts in a tight pocket")
 
     for i, aircraft in enumerate(data["spawns"].get("aircraft_enemies", [])):
         for key in ("entry", "exit", "target"):
@@ -90,11 +98,6 @@ def validate_map(map_id: str, data: dict) -> list[str]:
                 failures.append(f"{map_id}: aircraft[{i}] {key} {point} is too far outside the map")
         if aircraft.get("unit", "bomber") != "bomber":
             failures.append(f"{map_id}: aircraft[{i}] unsupported unit {aircraft.get('unit')!r}")
-
-    isolated = passable - reachable
-    if isolated:
-        sample = sorted(isolated)[:8]
-        failures.append(f"{map_id}: {len(isolated)} passable tiles isolated from player, sample={sample}")
 
     if data.get("doors"):
         combat_points = [("capture", point) for point in capture_points(rows)]

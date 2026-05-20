@@ -123,6 +123,8 @@ class TileMap:
         bad = [point for point in points if self.tile_at(point) in SOLID_TILES]
         if bad:
             raise ValueError(f"Map '{self.map_id}' has blocked spawn tiles: {bad}")
+        if len(points) != len(set(points)):
+            raise ValueError(f"Map '{self.map_id}' has overlapping spawn tiles")
 
     def _build_props(self) -> list[tuple[int, int, pygame.Surface]]:
         blocked_points = {self.spawns["player"], *self.spawns["enemies"], *self.spawns["tanks"], *self.door_tiles}

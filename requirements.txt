@@ -1,2 +1,2 @@
 pygame>=2.5.0
-
+imageio>=2.34.0

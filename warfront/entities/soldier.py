@@ -101,16 +101,38 @@ class Soldier:
 
     def get_nearest_target(self, targets: list):
         nearest = None
-        min_dist = float('inf')
+        min_score = float('inf')
+        nearest_dist = float('inf')
         for t in targets:
             if t.alive:
                 dist = pygame.Vector2(self.rect.center).distance_to(t.rect.center)
-                if dist < min_dist:
-                    min_dist = dist
+                score = dist
+                target_is_tank = bool(getattr(t, "tank", False) or hasattr(t, "kind"))
+                # Ưu tiên mục tiêu theo vai trò để bot đồng minh chọn đúng kèo giao chiến.
+                if self.tank:
+                    score *= 0.72 if target_is_tank else 1.12
+                else:
+                    if target_is_tank:
+                        score *= 1.22 if dist > self.weapon_range * 0.75 else 0.95
+                    else:
+                        score *= 0.86 if dist < self.weapon_range * 0.9 else 1.0
+                if getattr(t, "is_player", False) or getattr(t, "player_controlled", False):
+                    score *= 0.88
+                if score < min_score:
+                    min_score = score
+                    nearest_dist = dist
                     nearest = t
-        return nearest, min_dist
+        return nearest, nearest_dist
 
-    def update_bot(self, dt: float, enemies: list, follow_target, tilemap, path: list[tuple[int, int]] | None = None) -> list[Bullet]:
+    def update_bot(
+        self,
+        dt: float,
+        enemies: list,
+        follow_target,
+        tilemap,
+        path: list[tuple[int, int]] | None = None,
+        incoming_bullets: list[Bullet] | None = None,
+    ) -> list[Bullet]:
         bullets: list[Bullet] = []
         if not self.alive:
             self.moving = False
@@ -133,8 +155,39 @@ class Soldier:
             if follow_target and follow_target.alive:
                 follow_dist = pygame.Vector2(self.rect.center).distance_to(follow_target.rect.center)
 
+            dodge_step = pygame.Vector2()
+            dodge_radius = float(getattr(self, "bot_dodge_radius", 120.0))
+            dodge_chance = float(getattr(self, "bot_dodge_chance", 0.36))
+            threat = None
+            if incoming_bullets:
+                my_team_friendly = self.team == "player"
+                for bullet in incoming_bullets:
+                    if not getattr(bullet, "friendly", False) == my_team_friendly:
+                        bullet_dir = pygame.Vector2(getattr(bullet, "direction", (0, 0)))
+                        if not bullet_dir.length_squared():
+                            continue
+                        to_self = pygame.Vector2(self.rect.center) - pygame.Vector2(getattr(bullet, "pos", self.rect.center))
+                        if not to_self.length_squared():
+                            continue
+                        if to_self.length() > dodge_radius:
+                            continue
+                        if bullet_dir.normalize().dot(to_self.normalize()) < 0.72:
+                            continue
+                        threat = bullet
+                        break
+            if threat and (self.think_time <= 0 or random.random() < dodge_chance):
+                incoming = pygame.Vector2(getattr(threat, "direction", (1, 0)))
+                perp = pygame.Vector2(-incoming.y, incoming.x)
+                if perp.length_squared():
+                    if random.random() < 0.5:
+                        perp *= -1
+                    dodge_step = perp.normalize()
+                    self.think_time = random.uniform(0.22, 0.48)
+
             # Movement logic
-            if getattr(self, "difficulty", "normal") == "hard" and target and has_los and distance < 450:
+            if dodge_step.length_squared():
+                self.wander = dodge_step
+            elif getattr(self, "difficulty", "normal") == "hard" and target and has_los and distance < 450:
                 if self.think_time <= 0:
                     self.think_time = random.uniform(0.3, 0.7)
                     dodge_dir = random.choice([-1, 1])
@@ -148,7 +201,19 @@ class Soldier:
                 step = tilemap.tile_center(path[target_index]) - pygame.Vector2(self.rect.center)
                 self.wander = step.normalize() if step.length_squared() else pygame.Vector2()
             elif target and has_los and distance < self.weapon_range * 0.85 and getattr(self, "difficulty", "normal") != "hard":
-                self.wander = pygame.Vector2()
+                if self.team == "player" and self.think_time <= 0:
+                    # Đồng minh sẽ strafe nhẹ khi đang có LOS để giảm đứng yên "ngu người".
+                    self.think_time = random.uniform(0.28, 0.62)
+                    flank = pygame.Vector2(-to_target.y, to_target.x)
+                    if flank.length_squared():
+                        if random.random() < 0.5:
+                            flank *= -1
+                        forward = to_target.normalize() * random.uniform(0.08, 0.22)
+                        self.wander = (flank.normalize() * random.uniform(0.62, 1.0) + forward).normalize()
+                    else:
+                        self.wander = pygame.Vector2()
+                else:
+                    self.wander = pygame.Vector2()
             elif follow_target and follow_dist > 150:
                 step = pygame.Vector2(follow_target.rect.center) - pygame.Vector2(self.rect.center)
                 self.wander = step.normalize() if step.length_squared() else pygame.Vector2()
@@ -176,7 +241,7 @@ class Soldier:
 
             # Shoot logic (AI)
             if target and has_los and distance < self.weapon_range and self.reload <= 0:
-                self.reload = 1.2 if self.tank else 0.85
+                self.reload = float(getattr(self, "bot_reload_time", 1.2 if self.tank else 0.85))
                 if distance:
                     self.angle = self.aim_angle
                 self.shooting_flash = 0.12

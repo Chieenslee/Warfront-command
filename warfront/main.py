@@ -6,14 +6,6 @@ from pathlib import Path
 
 import pygame
 
-import math
-import random
-import sys
-import json
-from pathlib import Path
-
-import pygame
-
 from warfront.assets.loader import get_assets
 from warfront.assets.registry import ASSET_DIR
 from warfront.config import CAPTURE_SECONDS, FPS, SCREEN_HEIGHT, SCREEN_WIDTH, TILE_SIZE
@@ -37,6 +29,8 @@ from warfront.world.tilemap import TileMap
 from warfront.network import NetworkServer, NetworkClient
 
 SAVE_PATH = Path.home() / ".warfront_command" / "save.json"
+MEGA_MAP_IDS = {"jungle_outpost_mega", "trench_line_mega", "river_bridge_mega", "armored_front_mega"}
+PVP_SOLO_MAP_ID = "pvp_solo_arena"
 
 
 class _DummyBullet:
@@ -78,7 +72,7 @@ class Game:
         self.big_font = pygame.font.SysFont("consolas", 48, bold=True)
         self.assets = get_assets()
         pygame.mouse.set_visible(False)
-        self.map_ids = list(MAPS)
+        self.map_ids = [map_id for map_id in MAPS if not map_id.startswith("pvp_")]
         self.selected_map_index = self.map_ids.index(DEFAULT_MAP_ID)
         self.state = "name_input"
         self.previous_state = "title"
@@ -100,6 +94,7 @@ class Game:
         self.weapon_mode = "rifle"
         self.equipped_primary = "rifle"
         self.equipped_sidearm = "tokarev"
+        self.bot_difficulty = "normal"
         self.cutscene_index = 0
         self.cutscene_timer = 0.0
         self.sounds = self._load_sounds()
@@ -207,10 +202,101 @@ class Game:
         remote.vehicle = None
         return remote
 
+    def _is_mega_map(self, map_id: str | None = None) -> bool:
+        return (map_id or self.current_map_id) in MEGA_MAP_IDS
+
+    def _spawn_offline_ally_bots(self) -> list[Soldier]:
+        # Mega maps dùng đội hình đồng minh lớn hơn để bớt "ngu" do thiếu quân số.
+        total_bots = 6 if self._is_mega_map(self.tilemap.map_id) else 3
+        allies: list[Soldier] = []
+        for i in range(total_bots):
+            spawn_tile = self._player_spawn_tile(i + 1)
+            bot = Soldier(self.tilemap.spawn_position(spawn_tile), is_player=False, team="player", bot_name=f"Bot {i + 1}")
+            bot.speed = self.player.speed * 0.97
+            allies.append(bot)
+        return allies
+
+    def _spawn_ally_tank_bots(self, spawns: dict) -> list[TankVehicle]:
+        if not self._is_mega_map(self.tilemap.map_id) or getattr(self, "network_mode", "offline") != "offline":
+            return []
+        tank_tiles = [tuple(tile) for tile in spawns.get("tanks", [])]
+        if not tank_tiles:
+            base = tuple(spawns["player"])
+            tank_tiles = [(base[0] + 3, base[1] - 6), (base[0] - 3, base[1] - 6)]
+        tanks: list[TankVehicle] = []
+        for i, tile in enumerate(tank_tiles[:2]):
+            kind = "sherman" if i == 0 else "heavy_tank"
+            tank = TankVehicle(self.tilemap.spawn_position(tile), kind, faction="ally")
+            tank.rect.center = self.tilemap.tile_center(tile)
+            tank.pvp_team = "blue"
+            tanks.append(tank)
+        return tanks
+
+    def _pvp_bot_profile(self) -> dict:
+        difficulty = getattr(self, "bot_difficulty", "normal")
+        profiles = {
+            "easy": {
+                "weapon_pose": "rifle",
+                "range": 460,
+                "damage_mult": 1.1,
+                "speed_mult": 1.02,
+                "reload": 0.76,
+                "dodge_radius": 110.0,
+                "dodge_chance": 0.28,
+                "medkits": 1,
+                "grenades": 1,
+                "mortar": 0,
+            },
+            "normal": {
+                "weapon_pose": "sniper",
+                "range": 620,
+                "damage_mult": 1.45,
+                "speed_mult": 1.08,
+                "reload": 0.58,
+                "dodge_radius": 150.0,
+                "dodge_chance": 0.46,
+                "medkits": 2,
+                "grenades": 2,
+                "mortar": 1,
+            },
+            "hard": {
+                "weapon_pose": "sniper",
+                "range": 780,
+                "damage_mult": 1.9,
+                "speed_mult": 1.16,
+                "reload": 0.44,
+                "dodge_radius": 200.0,
+                "dodge_chance": 0.7,
+                "medkits": 3,
+                "grenades": 4,
+                "mortar": 2,
+            },
+        }
+        return profiles.get(difficulty, profiles["normal"])
+
+    def _configure_offline_pvp_bot(self, bot: Soldier) -> None:
+        profile = self._pvp_bot_profile()
+        bot.weapon_pose = profile["weapon_pose"]
+        bot.weapon_range = max(bot.weapon_range, int(profile["range"]))
+        bot.damage_amount = max(bot.damage_amount, int(bot.damage_amount * profile["damage_mult"]))
+        bot.speed *= profile["speed_mult"]
+        bot.bot_reload_time = profile["reload"]
+        bot.bot_dodge_radius = profile["dodge_radius"]
+        bot.bot_dodge_chance = profile["dodge_chance"]
+        bot.bot_medkits = profile["medkits"]
+        bot.bot_grenades = profile["grenades"]
+        bot.bot_mortar = profile["mortar"]
+        bot.bot_item_cooldown = 0.0
+        bot.bot_grenade_cooldown = 0.0
+        bot.bot_mortar_cooldown = 0.0
+
     def reset(self, map_id: str | None = None) -> None:
+        requested_map = map_id or self.current_map_id
         if map_id and map_id in self.map_ids:
             self.selected_map_index = self.map_ids.index(map_id)
-        self.tilemap = TileMap(map_id or self.current_map_id)
+        if getattr(self, "game_mode", "campaign") == "pvp" and getattr(self, "network_mode", "offline") == "offline":
+            requested_map = PVP_SOLO_MAP_ID
+        self.tilemap = TileMap(requested_map)
         self.camera = Camera(self.tilemap.width, self.tilemap.height)
         spawns = self.tilemap.spawns
         self.player = Soldier(self.tilemap.spawn_position(spawns["player"]), is_player=True, bot_name=getattr(self, "player_name", "Player"))
@@ -222,17 +308,13 @@ class Game:
                 # Spawn a single enemy PVP bot far from player
                 enemy_pos = self.tilemap.spawn_position(spawns["enemies"][0] if spawns["enemies"] else (self.player.rect.x + 400, self.player.rect.y + 400))
                 bot = Soldier(enemy_pos, is_player=False, team="enemy", bot_name=f"Bot ({getattr(self, 'bot_difficulty', 'normal')})", difficulty=getattr(self, "bot_difficulty", "normal"))
+                self._configure_offline_pvp_bot(bot)
                 self.enemies = [bot]
             else:
                 self.enemies = []
         else:
             if getattr(self, "network_mode", "offline") == "offline":
-                # Offline: spawn 3 AI ally bots
-                for i in range(1, 4):
-                    bot_pos = (self.player.rect.x + random.randint(-40, 40), self.player.rect.y + random.randint(-40, 40))
-                    bot = Soldier(bot_pos, is_player=False, team="player", bot_name=f"Bot {i}")
-                    bot.speed = self.player.speed * 0.95
-                    self.ally_bots.append(bot)
+                self.ally_bots = self._spawn_offline_ally_bots()
             # Online: do not spawn ally bots. Remote human players are created
             # only after real clients send input, so empty slots never overlap
             # with real accounts.
@@ -262,7 +344,9 @@ class Game:
             TankVehicle(self.tilemap.spawn_position(pos), self._enemy_tank_kind(index), faction="enemy")
             for index, pos in enumerate(spawns["tanks"])
         ]
+        self.ally_vehicle_bots = self._spawn_ally_tank_bots(spawns)
         self.vehicles = self._spawn_player_vehicles()
+        self.vehicles.extend(self.ally_vehicle_bots)
         pouch_level = self.campaign.purchases.get("field_pouches", 0)
         self.inventory.ammo = max(self.inventory.ammo, 45 + pouch_level * 20)
         self.inventory.medkits = max(self.inventory.medkits, 1 + pouch_level)
@@ -271,6 +355,8 @@ class Game:
         self.passable_grid = grid_from_tilemap(self.tilemap)
         self.reachable_tiles = dfs_reachable(self.tilemap.world_to_tile(self.player.rect.center), self.passable_grid)
         self.enemy_paths: dict[int, list[tuple[int, int]]] = {}
+        self.ally_paths: dict[int, list[tuple[int, int]]] = {}
+        self.ally_vehicle_paths: dict[int, list[tuple[int, int]]] = {}
         self.ai_timer = 0.0
         self.mission_started = self.tilemap.doors_open
         self.mission_grace = 0.0
@@ -724,6 +810,8 @@ class Game:
             return
 
         for vehicle in self.vehicles:
+            if vehicle in getattr(self, "ally_vehicle_bots", []):
+                continue
             if not vehicle.alive:
                 continue
             if pygame.Vector2(vehicle.rect.center).distance_to(self.player.rect.center) <= 78:
@@ -969,8 +1057,13 @@ class Game:
     def start_selected_map(self) -> None:
         self.weapon_mode = self.equipped_primary
         self.reset(self.current_map_id)
-        chapter = CHAPTERS_BY_MAP.get(self.current_map_id)
-        if chapter and getattr(chapter, "dialogues", ()) and getattr(self, "network_mode", "offline") == "offline":
+        chapter = CHAPTERS_BY_MAP.get(self.tilemap.map_id)
+        if (
+            getattr(self, "game_mode", "campaign") != "pvp"
+            and chapter
+            and getattr(chapter, "dialogues", ())
+            and getattr(self, "network_mode", "offline") == "offline"
+        ):
             self.state = "cutscene"
             self.cutscene_index = 0
             self.cutscene_timer = 0.0
@@ -1162,6 +1255,33 @@ class Game:
                         nearby_goal = bfs_nearest(enemy_tile, [target_tile], self.passable_grid)
                         path = astar(enemy_tile, nearby_goal, self.passable_grid) if nearby_goal else []
                     self.enemy_paths[id(enemy)] = path
+                hostile_targets = [*self.enemies, *self.enemy_vehicles]
+                self.ally_paths = {}
+                self.ally_vehicle_paths = {}
+                for bot in getattr(self, "ally_bots", []):
+                    if not bot.alive or getattr(bot, "player_controlled", False):
+                        continue
+                    if hostile_targets:
+                        nearest = min(hostile_targets, key=lambda e: pygame.Vector2(bot.rect.center).distance_to(e.rect.center))
+                        bot_tile = self.tilemap.world_to_tile(bot.rect.center)
+                        goal_tile = self.tilemap.world_to_tile(nearest.rect.center)
+                        path = astar(bot_tile, goal_tile, self.passable_grid)
+                        if not path:
+                            nearby_goal = bfs_nearest(bot_tile, [goal_tile], self.passable_grid)
+                            path = astar(bot_tile, nearby_goal, self.passable_grid) if nearby_goal else []
+                        self.ally_paths[id(bot)] = path
+                for vehicle in getattr(self, "ally_vehicle_bots", []):
+                    if not vehicle.alive or vehicle.occupied:
+                        continue
+                    if hostile_targets:
+                        nearest = min(hostile_targets, key=lambda e: pygame.Vector2(vehicle.rect.center).distance_to(e.rect.center))
+                        vehicle_tile = self.tilemap.world_to_tile(vehicle.rect.center)
+                        goal_tile = self.tilemap.world_to_tile(nearest.rect.center)
+                        path = astar(vehicle_tile, goal_tile, self.passable_grid)
+                        if not path:
+                            nearby_goal = bfs_nearest(vehicle_tile, [goal_tile], self.passable_grid)
+                            path = astar(vehicle_tile, nearby_goal, self.passable_grid) if nearby_goal else []
+                        self.ally_vehicle_paths[id(vehicle)] = path
 
             for enemy in self.enemies:
                 if self.mission_grace > 0:
@@ -1169,12 +1289,32 @@ class Game:
                 # Enemies target the nearest human player (host or any client bot)
                 all_human_targets = [self.active_actor] + [b for b in getattr(self, "ally_bots", []) if b.alive and b.player_controlled]
                 nearest_target = min(all_human_targets, key=lambda t: pygame.Vector2(enemy.rect.center).distance_to(t.rect.center))
-                self.bullets.extend(enemy.update_bot(dt, [nearest_target], follow_target=nearest_target, tilemap=self.tilemap, path=self.enemy_paths.get(id(enemy))))
+                self.bullets.extend(
+                    enemy.update_bot(
+                        dt,
+                        [nearest_target],
+                        follow_target=nearest_target,
+                        tilemap=self.tilemap,
+                        path=self.enemy_paths.get(id(enemy)),
+                        incoming_bullets=self.bullets,
+                    )
+                )
 
             for bot in getattr(self, "ally_bots", []):
                 if not getattr(bot, "player_controlled", False):
-                    self.bullets.extend(bot.update_bot(dt, self.enemies + self.enemy_vehicles, self.active_actor, self.tilemap))
+                    self.bullets.extend(
+                        bot.update_bot(
+                            dt,
+                            self.enemies + self.enemy_vehicles,
+                            self.active_actor,
+                            self.tilemap,
+                            path=self.ally_paths.get(id(bot)),
+                            incoming_bullets=self.bullets,
+                        )
+                    )
+            self._update_offline_pvp_bot_items(dt)
 
+            self.update_ally_vehicles(dt)
             self.update_enemy_vehicles(dt)
             self.update_enemy_aircraft(dt)
         if not is_client:
@@ -1302,7 +1442,7 @@ class Game:
 
         if not is_client:
             if self.mission_started and self.tilemap.capture_rect.colliderect(self.active_actor.rect):
-                map_config = MAPS.get(self.current_map_id)
+                map_config = MAPS.get(self.tilemap.map_id)
                 if map_config and "boss_wave" in map_config and not getattr(self, "boss_triggered", False):
                     self.boss_triggered = True
                     boss_data = map_config["boss_wave"]
@@ -1501,6 +1641,8 @@ class Game:
                                 break
                     else:
                         for vehicle in self.vehicles:
+                            if vehicle in getattr(self, "ally_vehicle_bots", []):
+                                continue
                             if vehicle.alive and not vehicle.occupied and pygame.Vector2(vehicle.rect.center).distance_to(bot.rect.center) <= 78:
                                 if vehicle.enter(bot):
                                     vehicle.pvp_team = session["team"]
@@ -1895,12 +2037,88 @@ class Game:
                     self.effects.muzzle_flash(vehicle.rect.center, bullet.direction, "tank")
                     self._play_sound("tank_fire")
 
+    def update_ally_vehicles(self, dt: float) -> None:
+        hostile_targets = [*self.enemies, *self.enemy_vehicles]
+        if not hostile_targets:
+            return
+        for vehicle in getattr(self, "ally_vehicle_bots", []):
+            if not vehicle.alive or vehicle.occupied:
+                continue
+            vehicle.moving = False
+            target = min(hostile_targets, key=lambda e: pygame.Vector2(vehicle.rect.center).distance_to(e.rect.center))
+            to_target = pygame.Vector2(target.rect.center) - pygame.Vector2(vehicle.rect.center)
+            distance = to_target.length()
+            path = self.ally_vehicle_paths.get(id(vehicle))
+            step = pygame.Vector2()
+            has_los = self.tilemap.has_line_of_sight(vehicle.rect.center, target.rect.center)
+            preferred_range = UNIT_STATS[vehicle.kind].range * 0.72
+            if path and len(path) > 1 and (not has_los or distance > preferred_range):
+                lookahead = 2 if len(path) > 2 else 1
+                next_tile = self.tilemap.tile_center(path[lookahead])
+                step = next_tile - pygame.Vector2(vehicle.rect.center)
+            elif distance < 210 and distance:
+                step = -to_target
+            elif distance > preferred_range and distance:
+                step = to_target
+            if step.length_squared():
+                vehicle.rotate_toward(math.degrees(math.atan2(step.y, step.x)), 110 * dt)
+                facing = pygame.Vector2(math.cos(math.radians(vehicle.angle)), math.sin(math.radians(vehicle.angle)))
+                self._move_vehicle(vehicle, facing * vehicle.speed * 0.64 * dt)
+            if distance:
+                vehicle.rotate_turret_toward(math.degrees(math.atan2(to_target.y, to_target.x)), 95 * dt)
+            if distance < UNIT_STATS[vehicle.kind].range and vehicle.reload <= 0 and has_los:
+                bullet = vehicle.shoot(target.rect.center)
+                if bullet:
+                    self.bullets.append(bullet)
+                    self.effects.muzzle_flash(vehicle.rect.center, bullet.direction, "tank")
+                    self._play_sound("tank_fire")
+
     def update_enemy_aircraft(self, dt: float) -> None:
         for aircraft in self.enemy_aircraft:
             target = aircraft.update(dt, self.active_actor.rect.center)
             if target is None or self.mission_grace > 0:
                 continue
             self.enemy_airstrike(target, aircraft)
+
+    def _update_offline_pvp_bot_items(self, dt: float) -> None:
+        if getattr(self, "game_mode", "campaign") != "pvp" or self.is_online() or not self.enemies:
+            return
+        bot = self.enemies[0]
+        if not bot.alive:
+            return
+        bot.bot_item_cooldown = max(0.0, float(getattr(bot, "bot_item_cooldown", 0.0)) - dt)
+        bot.bot_grenade_cooldown = max(0.0, float(getattr(bot, "bot_grenade_cooldown", 0.0)) - dt)
+        bot.bot_mortar_cooldown = max(0.0, float(getattr(bot, "bot_mortar_cooldown", 0.0)) - dt)
+
+        # Tự hồi máu khi nguy cấp để bot có cảm giác "VIP pro".
+        hp_threshold = bot.max_hp * (0.58 if getattr(self, "bot_difficulty", "normal") == "hard" else 0.42)
+        if getattr(bot, "bot_medkits", 0) > 0 and bot.hp <= hp_threshold and bot.bot_item_cooldown <= 0:
+            heal_amount = 42 if getattr(bot, "bot_difficulty", getattr(self, "bot_difficulty", "normal")) != "hard" else 58
+            bot.hp = min(bot.max_hp, bot.hp + heal_amount)
+            bot.bot_medkits -= 1
+            bot.bot_item_cooldown = 6.5
+            self.add_floater(f"+{heal_amount}", bot.rect.center, (108, 224, 116))
+            self._play_sound("heal")
+
+        distance = pygame.Vector2(bot.rect.center).distance_to(self.player.rect.center)
+        if getattr(bot, "bot_grenades", 0) > 0 and bot.bot_grenade_cooldown <= 0 and 150 <= distance <= 640:
+            lead = pygame.Vector2(self.player.rect.center) + pygame.Vector2(
+                math.cos(math.radians(getattr(self.player, "move_angle", 0.0))),
+                math.sin(math.radians(getattr(self.player, "move_angle", 0.0))),
+            ) * 34
+            grenade = GrenadeProjectile(bot.rect.center, lead, max_range=720)
+            grenade.owner_team = "red"
+            self.grenades.append(grenade)
+            bot.bot_grenades -= 1
+            bot.bot_grenade_cooldown = 5.8 if getattr(self, "bot_difficulty", "normal") == "hard" else 7.2
+            self._play_sound("grenade")
+
+        if getattr(bot, "bot_mortar", 0) > 0 and bot.bot_mortar_cooldown <= 0 and distance >= 260:
+            target = pygame.Vector2(self.player.rect.center) + pygame.Vector2(random.uniform(-32, 32), random.uniform(-32, 32))
+            self.mortar_shells.append(MortarShell(target, weapon_id="mortar", hostile=True, delay=0.72))
+            bot.bot_mortar -= 1
+            bot.bot_mortar_cooldown = 10.5
+            self.add_radio("VIP BOT CALLED MORTAR", (255, 184, 150), 2.2)
 
     def enemy_airstrike(self, target, aircraft: EnemyAircraft) -> None:
         target = pygame.Vector2(target)
@@ -3044,6 +3262,8 @@ class Game:
             title = self.font.render("SIÊU TĂNG HẠNG NẶNG (BOSS)", True, (255, 184, 150))
             self.screen.blit(title, title.get_rect(center=(SCREEN_WIDTH // 2, 25)))
         vehicle_hint = "E: lên/xuống xe   " if self.vehicles else ""
+        if getattr(self.player, "vehicle", None):
+            vehicle_hint += "W/S tiến-lùi, A/D xoay thân, chuột xoay tháp pháo   "
         door_hint = "E: mở cổng an toàn   " if not self.tilemap.doors_open else ""
         objective = "Mở cổng để bắt đầu" if not self.mission_started else "Tiêu diệt địch và chiếm cứ điểm"
         hint = f"{door_hint}{vehicle_hint}{objective}".strip()
