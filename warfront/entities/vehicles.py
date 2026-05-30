@@ -67,6 +67,17 @@ TANK_STATS: dict[str, VehicleStats] = {
         projectile_life=1.75,
         sprite_height=82,
     ),
+    "super_heavy": VehicleStats(
+        size=(48, 44),
+        max_hp=UNIT_STATS["super_heavy"].hp,
+        armor=UNIT_STATS["super_heavy"].armor,
+        speed=UNIT_STATS["super_heavy"].speed,
+        damage=UNIT_STATS["super_heavy"].damage,
+        bullet_speed=500,
+        reload_time=2.0,
+        projectile_life=2.0,
+        sprite_height=90,
+    ),
 }
 
 
@@ -213,6 +224,7 @@ class TankVehicle(Vehicle):
             speed=self.stats.speed,
             faction=faction,
         )
+        self._sprite_cache: dict[tuple[int, int, bool], pygame.Surface] = {}
 
     def shoot(self, target) -> Bullet | None:
         if not self.alive or self.reload > 0:
@@ -225,7 +237,7 @@ class TankVehicle(Vehicle):
                 return None
         direction = pygame.Vector2(math.cos(math.radians(self.turret_angle)), math.sin(math.radians(self.turret_angle)))
         self.reload = self.stats.reload_time
-        self.shooting_flash = 0.14
+        self.shooting_flash = 0.28
 
         bullet = Bullet(self.rect.center, direction, friendly=self.faction == "ally")
         bullet.damage = self.stats.damage
@@ -256,26 +268,43 @@ class TankVehicle(Vehicle):
             flash.fill((255, 238, 190, 70))
             screen.blit(flash, sprite_rect)
 
-        base = pygame.Vector2(sprite_rect.centerx, sprite_rect.centery - 4)
-
         if self.shooting_flash > 0:
-            barrel = pygame.Vector2(math.cos(math.radians(self.turret_angle)), math.sin(math.radians(self.turret_angle)))
-            muzzle = base + barrel * (self.stats.sprite_height * 0.5)
-            pygame.draw.circle(screen, (248, 197, 82), muzzle, 8)
-            pygame.draw.circle(screen, (255, 238, 190), muzzle, 4)
-
-        turret = pygame.Vector2(math.cos(math.radians(self.turret_angle)), math.sin(math.radians(self.turret_angle)))
-        end = base + turret * (self.stats.sprite_height * 0.34)
-        pygame.draw.line(screen, (40, 44, 38), base, end, 6)
-        pygame.draw.line(screen, (95, 101, 82), base, end, 3)
+            muzzle = self._sprite_muzzle(sprite_rect)
+            pygame.draw.circle(screen, (248, 197, 82), muzzle, 7)
+            pygame.draw.circle(screen, (255, 238, 190), muzzle, 3)
 
         self._draw_hp(screen, pygame.Rect(sprite_rect.left, sprite_rect.top, sprite_rect.width, sprite_rect.height))
 
     def _current_sprite(self) -> pygame.Surface:
         indices = self._tank_indices()
-        frame = indices[int(self.anim_time * 8) % len(indices)]
+        frame = indices[int(self.anim_time * self._anim_fps()) % len(indices)]
+        flip = self._direction_bucket() == 1
+        key = (frame, self.stats.sprite_height, flip)
+        cached = self._sprite_cache.get(key)
+        if cached is not None:
+            return cached
         sprite = get_assets().frame("m4_sherman", frame, self.stats.sprite_height)
-        return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 3 else sprite
+        if flip:
+            sprite = pygame.transform.flip(sprite, True, False)
+        self._sprite_cache[key] = sprite
+        return sprite
+
+    def _anim_fps(self) -> float:
+        if not self.alive:
+            return 6.0
+        if self.shooting_flash > 0:
+            return 14.0
+        return 9.0 if self.moving else 1.0
+
+    def _sprite_muzzle(self, sprite_rect: pygame.Rect) -> tuple[int, int]:
+        bucket = self._direction_bucket()
+        if bucket == 0:
+            return sprite_rect.centerx, sprite_rect.top + int(sprite_rect.height * 0.12)
+        if bucket == 2:
+            return sprite_rect.centerx, sprite_rect.bottom - int(sprite_rect.height * 0.22)
+        if bucket == 1:
+            return sprite_rect.left + int(sprite_rect.width * 0.1), sprite_rect.centery - int(sprite_rect.height * 0.04)
+        return sprite_rect.right - int(sprite_rect.width * 0.1), sprite_rect.centery - int(sprite_rect.height * 0.04)
 
     def _direction_bucket(self) -> int:
         angle = self.angle % 360

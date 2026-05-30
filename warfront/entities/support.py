@@ -1,3 +1,5 @@
+import random
+
 import pygame
 
 from warfront.assets.loader import get_assets
@@ -23,7 +25,7 @@ class EnemyAircraft:
         self.speed = self.stats.speed
         self.angular_speed = self.speed / self.radius
         self.reload = 2.0
-        self.bomb_cooldown = 3.0
+        self.bomb_cooldown = random.uniform(2.6, 7.4)
         self.flash = 0.0
         self.anim_time = 0.0
 
@@ -54,7 +56,7 @@ class EnemyAircraft:
         player = pygame.Vector2(target_pos)
         # Drop bomb if player is within range
         if self.bomb_cooldown <= 0 and player.distance_to(self.pos) <= 400:
-            self.bomb_cooldown = 4.8
+            self.bomb_cooldown = random.uniform(6.0, 9.2)
             return player
         return None
 
@@ -100,9 +102,13 @@ class MortarShell:
         self.done = self.timer >= self.delay
         return not self.done
 
-    def draw(self, screen: pygame.Surface, camera) -> None:
+    @property
+    def pos(self) -> pygame.Vector2:
         t = min(1.0, self.timer / self.delay)
-        pos = self.target - camera.offset + pygame.Vector2(0, -260 * (1 - t))
+        return self.target + pygame.Vector2(0, -260 * (1 - t))
+
+    def draw(self, screen: pygame.Surface, camera) -> None:
+        pos = self.pos - camera.offset
         sprite_index = 101 if self.hostile else 98
         sprite = get_assets().frame("prop", sprite_index, 34)
         sprite = pygame.transform.rotate(sprite, -65 if not self.hostile else -110)

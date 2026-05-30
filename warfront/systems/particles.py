@@ -5,6 +5,9 @@ import pygame
 from warfront.assets.loader import get_assets
 
 
+MAX_PARTICLES = 650
+
+
 class Particle:
     def __init__(self, pos, vel, radius, color, life, sprite: pygame.Surface | None = None):
         self.pos = pygame.Vector2(pos)
@@ -50,22 +53,34 @@ class ParticleSystem:
             vel = pygame.Vector2(random.uniform(-170, 170), random.uniform(-170, 170))
             self.particles.append(Particle(pos, vel, random.randint(2, 4), (244, 181, 72), random.uniform(0.18, 0.38)))
 
-    def explosion(self, pos) -> None:
+    def explosion(self, pos, intensity: float = 1.0) -> None:
         center = pygame.Vector2(pos)
-        self.smoke(center, 18)
-        self.sparks(center, 26)
-        for i in range(24):
-            angle = i / 24 * 6.28318
+        intensity = max(0.2, min(1.0, float(intensity)))
+        self.smoke(center, max(3, int(18 * intensity)))
+        self.sparks(center, max(4, int(26 * intensity)))
+        burst_count = max(6, int(24 * intensity))
+        for i in range(burst_count):
+            angle = i / burst_count * 6.28318
             speed = random.uniform(80, 210)
             vel = pygame.Vector2(speed, 0).rotate_rad(angle)
             color = random.choice(((255, 226, 126), (246, 143, 63), (209, 72, 45), (255, 246, 188)))
             self.particles.append(Particle(center, vel, random.randint(5, 11), color, random.uniform(0.18, 0.34)))
-        for radius, life in ((26, 0.18), (42, 0.24), (58, 0.3)):
+        rings = ((26, 0.18), (42, 0.24), (58, 0.3)) if intensity >= 0.75 else ((28, 0.2),)
+        for radius, life in rings:
             self.particles.append(Particle(center, (0, 0), radius, (248, 197, 82), life))
+
+    def sprite(self, pos, group: str, index: int, target_height: int, life: float = 0.22, vel=(0, 0)) -> None:
+        frame = self.assets.frame(group, index, target_height)
+        self.particles.append(Particle(pos, vel, max(1, target_height // 2), (255, 255, 255), life, frame))
 
     def update(self, dt: float) -> None:
         self.particles = [p for p in self.particles if p.update(dt)]
+        if len(self.particles) > MAX_PARTICLES:
+            self.particles = sorted(self.particles, key=lambda p: p.life / max(0.001, p.max_life))[-MAX_PARTICLES:]
 
     def draw(self, screen: pygame.Surface, camera) -> None:
+        view = screen.get_rect().inflate(180, 180)
         for particle in self.particles:
-            particle.draw(screen, camera)
+            screen_pos = particle.pos - camera.offset
+            if view.collidepoint(int(screen_pos.x), int(screen_pos.y)):
+                particle.draw(screen, camera)

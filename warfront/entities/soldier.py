@@ -10,6 +10,11 @@ from warfront.entities.projectile import Bullet
 from warfront.systems.balance import UNIT_STATS
 
 
+SOLDIER_RENDER_HEIGHT = 78
+SOLDIER_DOWNED_RENDER_HEIGHT = 52
+TANK_RENDER_HEIGHT = 76
+
+
 def move_with_collision(rect: pygame.Rect, delta: pygame.Vector2, tilemap) -> pygame.Rect:
     moved = rect.copy()
     moved.x += int(delta.x)
@@ -66,11 +71,11 @@ class Soldier:
         actual = max(1, int(amount) - mitigation)
         self.hp = max(0, self.hp - actual)
         if self.hp <= 0:
-            self.dead_time = 0.45 if not self.tank else 0.75
+            self.dead_time = 1.2 if not self.tank else 0.75
             self.moving = False
             self.shooting_flash = 0.0
             self.melee_flash = 0.0
-        self.flash = 0.12
+        self.flash = 0.2 if self.hp > 0 and not self.tank else 0.12
         return actual
 
     def update_player(self, dt: float, keys, mouse_world, tilemap) -> None:
@@ -336,21 +341,29 @@ class Soldier:
         if self.tank:
             indices = self._tank_indices()
             frame = indices[int(self.anim_time * 8) % len(indices)]
-            sprite = assets.frame("m4_sherman", frame, 70)
-            return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 3 else sprite
+            sprite = assets.frame("m4_sherman", frame, TANK_RENDER_HEIGHT)
+            return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 1 else sprite
 
         group = "allied_soldier" if self.team == "player" else "axis_soldier"
         state, indices = self._soldier_animation()
         if state != self.anim_state:
             self.anim_state = state
             self.anim_time = 0.0
-        if state == "downed":
+        if state in {"downed", "hit"}:
             frame_index = min(int(self.anim_time * 8), len(indices) - 1)
         else:
             frame_index = int(self.anim_time * self._anim_fps()) % len(indices)
         frame = indices[frame_index]
-        sprite = assets.frame(group, frame, 70)
-        return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 3 else sprite
+        sprite = assets.frame(group, frame, self._soldier_render_height(state))
+        if state in {"downed", "hit"}:
+            return sprite
+        return pygame.transform.flip(sprite, True, False) if self._direction_bucket() == 1 else sprite
+
+    @staticmethod
+    def _soldier_render_height(state: str) -> int:
+        if state == "downed":
+            return SOLDIER_DOWNED_RENDER_HEIGHT
+        return SOLDIER_RENDER_HEIGHT
 
     def _tick_timers(self, dt: float) -> None:
         self.reload = max(0.0, self.reload - dt)
@@ -383,6 +396,8 @@ class Soldier:
         faction = "allied" if self.team == "player" else "axis"
         if not self.alive:
             return "downed", get_soldier_frames(faction, "downed")
+        if self.flash > 0 and not self.tank:
+            return "hit", get_soldier_frames(faction, "hit")
         if self.melee_flash > 0:
             return f"melee_{direction}", get_soldier_frames(faction, "melee_bash", direction)
         if self.shooting_flash > 0:

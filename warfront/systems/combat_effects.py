@@ -83,6 +83,12 @@ class CombatEffects:
         direction = _direction(event.direction)
         amount = _scaled({"rifle": 5, "tank": 12, "grenade": 7, "bomber": 16}[event.weapon], event.scale)
         radius = {"rifle": 3, "tank": 5, "grenade": 4, "bomber": 6}[event.weapon]
+        if event.weapon == "tank":
+            self._sprite_effect(pos + direction * 18, 0, 6, 56, 0.12)
+        elif event.weapon == "bomber":
+            self._sprite_effect(pos + direction * 18, 36, 6, 64, 0.14)
+        else:
+            self._sprite_effect(pos + direction * 12, 72, 6, 34, 0.1)
 
         for _ in range(amount):
             spread = pygame.Vector2(random.uniform(-0.35, 0.35), random.uniform(-0.35, 0.35))
@@ -95,11 +101,13 @@ class CombatEffects:
 
     def _spawn_bullet_hit(self, event: CombatEffectEvent) -> None:
         if event.weapon == "tank":
+            self._sprite_effect(event.pos, 0, 18, 86, 0.24)
             self.particles.sparks(event.pos, _scaled(14, event.scale))
             self.particles.smoke(event.pos, _scaled(8, event.scale))
             return
 
         if event.weapon == "grenade":
+            self._sprite_effect(event.pos, 72, 24, 76, 0.28)
             self.particles.explosion(event.pos)
             self.particles.smoke(event.pos, _scaled(8, event.scale))
             return
@@ -108,14 +116,17 @@ class CombatEffects:
             self._spawn_bomber_strike(event)
             return
 
+        self._sprite_effect(event.pos, 72, 10, 38, 0.16)
         self.particles.sparks(event.pos, _scaled(7, event.scale))
 
     def _spawn_soldier_death_smoke(self, event: CombatEffectEvent) -> None:
+        self._sprite_effect(event.pos, 72, 12, 52, 0.3)
         self.particles.smoke(event.pos, _scaled(10 if event.weapon == "grenade" else 6, event.scale))
         if event.weapon in ("grenade", "tank", "bomber"):
             self.particles.sparks(event.pos, _scaled(6, event.scale))
 
     def _spawn_tank_explosion(self, event: CombatEffectEvent) -> None:
+        self._sprite_effect(event.pos, 0, 36, 118, 0.36)
         self.particles.explosion(event.pos)
         self.particles.smoke(event.pos, _scaled(18, event.scale))
         self.particles.sparks(event.pos, _scaled(18, event.scale))
@@ -124,18 +135,27 @@ class CombatEffects:
         center = pygame.Vector2(event.pos)
         direction = _direction(event.direction)
         side = pygame.Vector2(-direction.y, direction.x)
+        large = event.scale >= 0.9
 
-        for offset in (-30, 0, 30):
+        offsets = (-24, 24) if event.scale < 0.85 else (-30, 0, 30)
+        for offset in offsets:
             impact = center + side * offset * event.scale
-            self.particles.explosion(impact)
-            self.particles.smoke(impact - direction * 20, _scaled(10, event.scale))
+            self._sprite_effect(impact, 36, 20 if large else 12, 78 if event.scale < 0.85 else 96, 0.26)
+            self.particles.explosion(impact, intensity=0.42 if event.scale < 0.85 else 0.68)
+            self.particles.smoke(impact - direction * 20, _scaled(4 if event.scale < 0.85 else 7, event.scale))
 
-        for _ in range(_scaled(20, event.scale)):
+        for _ in range(_scaled(8 if event.scale < 0.85 else 14, event.scale)):
             vel = -direction * random.uniform(80, 160) + side * random.uniform(-90, 90)
             self._add(center, vel, random.randint(4, 8), (99, 95, 84), random.uniform(0.35, 0.7))
 
     def _add(self, pos, vel, radius: int, color: tuple[int, int, int], life: float) -> None:
         self.particles.particles.append(Particle(pos, vel, radius, color, life))
+
+    def _sprite_effect(self, pos, start: int, count: int, target_height: int, life: float) -> None:
+        if self.particles is None:
+            return
+        index = start + random.randrange(max(1, count))
+        self.particles.sprite(pos, "effects", index, target_height, life)
 
 
 def make_combat_effect(

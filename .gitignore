@@ -21,3 +21,7 @@ tn_asset_catalog.png
 
 .DS_Store
 Thumbs.db
+
+# Local presentation renders and recordings
+*.mp4
+/Warfront_Release/WarfrontCommand_Presentation.pptx

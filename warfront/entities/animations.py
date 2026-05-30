@@ -15,6 +15,8 @@ _SOLDIER_FACTIONS = {"allied", "axis"}
 _SOLDIER_ACTION_ALIASES = {
     "dead": "downed",
     "death": "downed",
+    "damage": "hit",
+    "hurt": "hit",
     "run": "walk",
     "shoot": "fire",
     "shooting": "fire",
@@ -64,6 +66,7 @@ _BASE_SOLDIER_ACTIONS: dict[Action, dict[Direction, list[int]] | list[int]] = {
         "up": [7, 28, 29, 31, 32, 33, 34, 35],
         "side": [8, 9, 10, 11, 12, 13, 21, 22, 23, 24, 25, 26],
     },
+    "hit": [19],
     "downed": [174, 175, 176],
 }
 
@@ -130,6 +133,13 @@ def _load_animation_overrides() -> None:
 
 
 _load_animation_overrides()
+
+# Hit/death frames are not symmetric between the allied and axis cut sheets.
+# Keep these pinned to the verified files in assets/cut_sprites/characters.
+SOLDIER_ANIMATIONS["allied"]["hit"] = [19]
+SOLDIER_ANIMATIONS["axis"]["hit"] = [0]
+SOLDIER_ANIMATIONS["allied"]["downed"] = [176]
+SOLDIER_ANIMATIONS["axis"]["downed"] = [173]
 
 
 def _normalise_direction(direction: str) -> str:

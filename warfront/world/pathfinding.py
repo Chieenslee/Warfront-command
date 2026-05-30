@@ -77,7 +77,7 @@ def dfs_reachable(start: Tile, passable: Passable) -> set[Tile]:
     return reachable
 
 
-def astar(start: Tile, goal: Tile, passable: Passable) -> list[Tile]:
+def astar(start: Tile, goal: Tile, passable: Passable, max_nodes: int | None = None) -> list[Tile]:
     """Return a shortest path from ``start`` to ``goal`` with A*.
 
     The returned path includes both endpoints. An empty list means no path was
@@ -95,8 +95,12 @@ def astar(start: Tile, goal: Tile, passable: Passable) -> list[Tile]:
     came_from: dict[Tile, Tile | None] = {start: None}
     cost_so_far: dict[Tile, int] = {start: 0}
 
+    expanded = 0
     while frontier:
         _, _, current = heappop(frontier)
+        expanded += 1
+        if max_nodes is not None and expanded > max_nodes:
+            return []
         if current == goal:
             return _reconstruct_path(came_from, goal)
 

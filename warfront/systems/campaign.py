@@ -88,7 +88,12 @@ STORY_CHAPTERS: tuple[StoryChapter, ...] = (
         briefing="Bản đồ được mở rộng gấp 16 lần. Rừng rậm hơn, nhiều con đường nhỏ tuần tra hơn. Tăng số lượng kẻ địch và xe tăng, bổ sung nhiều trạm đạn/máu rải rác.",
         objective="Sống sót trong tiền đồn khổng lồ.",
         reward=500,
-        dialogues=(),
+        dialogues=(
+            ("CHỈ HUY", "Tien Phong, tin hieu cu o khu rung da bien mat. Ban do cu khong con dung nua."),
+            ("TRINH SAT", "Chung toi thay nhieu cum trai moi, duong tuan tra dan cheo nhau va dau vet xe boc thep trong rung."),
+            ("CHỈ HUY", "Muc tieu la mo cong an toan, giu doi hinh bot dong minh gan nhau va danh sap tram chi huy sau cung."),
+            ("TIEN PHONG", "Da ro. Chung toi se tien cham, lay tiep te tren duong va khong de rung nuot mat doi hinh."),
+        ),
     ),
     StoryChapter(
         id="chapter_06",
@@ -97,7 +102,12 @@ STORY_CHAPTERS: tuple[StoryChapter, ...] = (
         briefing="Bản đồ mở rộng khổng lồ với các chiến hào chằng chịt.",
         objective="Xuyên thủng phòng tuyến khổng lồ.",
         reward=500,
-        dialogues=(),
+        dialogues=(
+            ("CHỈ HUY", "Phia truoc la toan bo mang chien hao cua dich. Khong con la mot tuyen phong thu don le nua."),
+            ("TRINH SAT", "May bay dich quay vong tren dau, xe tang nang nam sau cac lop hao."),
+            ("CHỈ HUY", "Dung nuoc, hao va vat can de cat doi hoa luc. Neu lao thang vao giua, doi hinh se bi xoa sach."),
+            ("TIEN PHONG", "Da nhan lenh. Chung toi se chiem tung nut giao thong va mo loi cho luc luong chinh."),
+        ),
     ),
     StoryChapter(
         id="chapter_07",
@@ -106,7 +116,12 @@ STORY_CHAPTERS: tuple[StoryChapter, ...] = (
         briefing="Một vùng đồng bằng rộng lớn với nhiều cây cầu.",
         objective="Kiểm soát toàn bộ mạng lưới cầu.",
         reward=500,
-        dialogues=(),
+        dialogues=(
+            ("CHỈ HUY", "Tat ca duong tiep van dang do ve cau Huyet Mach. Neu mat cau, chien dich ket thuc."),
+            ("TRINH SAT", "Song chia nhanh thanh nhieu cum. Dan co the ban qua nuoc, nhung nguoi va xe van bi chan lai."),
+            ("CHỈ HUY", "Tan dung tam ban AK va phao kich. Uu tien ha may bay truoc khi tien vao diem chiem."),
+            ("TIEN PHONG", "Ro. Chung toi se khoa tung dau cau va khong de xe tang dich vuot qua."),
+        ),
     ),
     StoryChapter(
         id="chapter_08",
@@ -115,77 +130,18 @@ STORY_CHAPTERS: tuple[StoryChapter, ...] = (
         briefing="Siêu chiến trường dành cho xe tăng.",
         objective="Chiến đấu trong siêu chiến trường xe tăng.",
         reward=800,
-        dialogues=(),
+        dialogues=(
+            ("CHỈ HUY", "Day la tuyen cuoi. Dich dua toan bo thiet giap nang va may bay nem bom vao khu nha ga."),
+            ("TRINH SAT", "Nhieu kho tiep te nam trong cac khoang cong su. Tat ca da duoc danh dau tren ban do."),
+            ("CHỈ HUY", "Bot dong minh va xe tang cua ta phai duoc nang cap truoc khi vao. Boss tank se khong nga nhanh dau."),
+            ("TIEN PHONG", "Da ro. Neu chung muon giu tuyen dau nay, chung se phai tra bang tung chiec xe tang."),
+        ),
     ),
 )
 
 CHAPTERS_BY_MAP: dict[str, StoryChapter] = {chapter.map_id: chapter for chapter in STORY_CHAPTERS}
 
 SHOP_ITEMS: dict[str, ShopItem] = {
-    "ak47": ShopItem(
-        id="ak47",
-        name="AK-47",
-        kind="weapon",
-        cost=180,
-        description="Súng trường tấn công đáng tin cậy với sức sát thương lớn ở tầm gần.",
-        max_purchases=1,
-    ),
-    "ak74": ShopItem(
-        id="ak74",
-        name="AK-74",
-        kind="weapon",
-        cost=230,
-        description="Súng trường tốc độ cao, dễ kiểm soát khi vừa di chuyển vừa bắn.",
-        max_purchases=1,
-    ),
-    "stv_380": ShopItem(
-        id="stv_380",
-        name="STV-380",
-        kind="weapon",
-        cost=280,
-        description="Súng trường hiện đại tối ưu cho độ chính xác và duy trì hỏa lực.",
-        max_purchases=1,
-    ),
-    "svd": ShopItem(
-        id="svd",
-        name="SVD",
-        kind="weapon",
-        cost=310,
-        description="Súng bắn tỉa tầm xa có khả năng xuyên giáp cực mạnh.",
-        max_purchases=1,
-    ),
-    "mosin": ShopItem(
-        id="mosin",
-        name="Mosin Sniper",
-        kind="weapon",
-        cost=260,
-        description="Súng trường lên đạn thủ công, sát thương rất cao ở cự ly xa.",
-        max_purchases=1,
-    ),
-    "vss": ShopItem(
-        id="vss",
-        name="VSS",
-        kind="weapon",
-        cost=340,
-        description="Súng trường bắn tỉa giảm thanh dùng cho các cuộc phục kích.",
-        max_purchases=1,
-    ),
-    "tokarev": ShopItem(
-        id="tokarev",
-        name="Tokarev TT-33",
-        kind="weapon",
-        cost=120,
-        description="Súng lục dự phòng, xử lý nhanh khi súng chính hết đạn.",
-        max_purchases=1,
-    ),
-    "makarov": ShopItem(
-        id="makarov",
-        name="Makarov PM",
-        kind="weapon",
-        cost=95,
-        description="Súng lục dự phòng giá rẻ với độ giật thấp.",
-        max_purchases=1,
-    ),
     "medkit": ShopItem(
         id="medkit",
         name="Túi Cứu Thương",
@@ -220,7 +176,7 @@ SHOP_ITEMS: dict[str, ShopItem] = {
         name="Xe Tăng Sherman",
         kind="vehicle",
         cost=220,
-        description="Triển khai một xe tăng có thể điều khiển tại cứ điểm an toàn.",
+        description="Bật/tắt xe tăng hỗ trợ. Tắt sẽ hoàn lại đúng số credits đã mua.",
         max_purchases=1,
     ),
     "mortar": ShopItem(
@@ -233,19 +189,19 @@ SHOP_ITEMS: dict[str, ShopItem] = {
     ),
     "weapon_training": ShopItem(
         id="weapon_training",
-        name="Huấn Luyện Xạ Thủ",
+        name="Nâng Cấp AK",
         kind="upgrade",
         cost=260,
-        description="Tăng mạnh sát thương cơ bản cho mọi loại vũ khí.",
-        max_purchases=5,
+        description="9 cấp sát thương cho AK. Cấp 9 đạt 200 damage.",
+        max_purchases=9,
     ),
-    "reload_drill": ShopItem(
-        id="reload_drill",
-        name="Luyện Tập Nạp Đạn",
+    "ally_training": ShopItem(
+        id="ally_training",
+        name="Nâng Cấp Bot Đồng Minh",
         kind="upgrade",
-        cost=240,
-        description="Cải thiện nhịp độ bắn bằng cách giảm độ trễ vũ khí.",
-        max_purchases=4,
+        cost=260,
+        description="9 cấp sát thương cho bot đồng minh. Cấp 9 đạt 200 damage.",
+        max_purchases=9,
     ),
     "field_pouches": ShopItem(
         id="field_pouches",
@@ -260,7 +216,7 @@ SHOP_ITEMS: dict[str, ShopItem] = {
 
 @dataclass
 class CampaignState:
-    credits: int = 0
+    credits: int = 500
     unlocked_maps: set[str] = field(default_factory=lambda: {"jungle_outpost"})
     purchases: dict[str, int] = field(default_factory=dict)
 
@@ -293,7 +249,7 @@ class CampaignState:
     @classmethod
     def from_dict(cls, data: dict) -> "CampaignState":
         state = cls(
-            credits=int(data.get("credits", 99999)),
+            credits=int(data.get("credits", 500)),
             unlocked_maps=set(data.get("unlocked_maps", ["jungle_outpost"])),
             purchases={str(key): int(value) for key, value in data.get("purchases", {}).items()},
         )

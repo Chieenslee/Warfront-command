@@ -28,9 +28,14 @@ from warfront.world.map_data import DEFAULT_MAP_ID, MAPS
 from warfront.world.tilemap import TileMap
 from warfront.network import NetworkServer, NetworkClient
 
-SAVE_PATH = Path.home() / ".warfront_command" / "save.json"
+SAVE_DIR = Path.home() / ".warfront_command"
+DEFAULT_CREDITS = 500
 MEGA_MAP_IDS = {"jungle_outpost_mega", "trench_line_mega", "river_bridge_mega", "armored_front_mega"}
 PVP_SOLO_MAP_ID = "pvp_solo_arena"
+MEGA_ESCALATION_MAPS = ["jungle_outpost_mega", "trench_line_mega", "river_bridge_mega", "armored_front_mega"]
+AK_BASE_DAMAGE = 38
+AK_MAX_DAMAGE = 200
+UPGRADE_LEVELS = 9
 
 
 class _DummyBullet:
@@ -82,18 +87,25 @@ class Game:
         self.menu_tab = "operations"
         self.shop_page = 0
         self.shop_filter = "all"
+        self.code_entry = ""
+        self.code_active = False
+        self.code_notice = ""
         self.title_buttons: list[tuple[pygame.Rect, str]] = []
         self.title_selection = 0
         self.title_notice = ""
         self.menu_buttons: list[tuple[pygame.Rect, str]] = []
         self.result_buttons: list[tuple[pygame.Rect, str]] = []
         self.lobby_buttons: list[tuple[pygame.Rect, str]] = []
+        self._map_preview_cache: dict[tuple[int, int, int, bool], pygame.Surface] = {}
+        self._menu_surface_cache: dict[tuple[str, int, int, int], pygame.Surface] = {}
+        self._fit_text_cache: dict[tuple[str, int, int], str] = {}
+        self._objective_icon_small = pygame.transform.smoothscale(self.assets.icons["objective"], (26, 26))
         self.campaign = self._load_campaign()
         self.mode_config: ModeConfig = OFFLINE_CONFIG
         self.inventory = Inventory(medkits=1, grenades=1, ammo=90)
-        self.weapon_mode = "rifle"
-        self.equipped_primary = "rifle"
-        self.equipped_sidearm = "tokarev"
+        self.weapon_mode = "ak47"
+        self.equipped_primary = "ak47"
+        self.equipped_sidearm = "ak47"
         self.bot_difficulty = "normal"
         self.cutscene_index = 0
         self.cutscene_timer = 0.0
@@ -156,9 +168,9 @@ class Game:
                 "name": name,
                 "team": self._remote_team_for_slot(slot),
                 "inventory": Inventory(medkits=1 + pouch_level, grenades=1 + pouch_level, ammo=90 + pouch_level * 20),
-                "primary": self.equipped_primary,
-                "sidearm": self.equipped_sidearm,
-                "weapon_mode": self.equipped_primary,
+                "primary": "ak47",
+                "sidearm": "ak47",
+                "weapon_mode": "ak47",
                 "vehicle": None,
                 "connected": True,
                 "last_slot": slot,
@@ -205,6 +217,25 @@ class Game:
     def _is_mega_map(self, map_id: str | None = None) -> bool:
         return (map_id or self.current_map_id) in MEGA_MAP_IDS
 
+    def _camera_world_rect(self, margin: int = 0) -> pygame.Rect:
+        width, height = self.screen.get_size()
+        return pygame.Rect(
+            int(self.camera.offset.x) - margin,
+            int(self.camera.offset.y) - margin,
+            width + margin * 2,
+            height + margin * 2,
+        )
+
+    def _rect_in_camera_load(self, rect: pygame.Rect, margin: int = 760) -> bool:
+        if not self._is_mega_map(getattr(self.tilemap, "map_id", None)):
+            return True
+        return self._camera_world_rect(margin).colliderect(rect)
+
+    def _point_in_camera_load(self, point, margin: int = 320) -> bool:
+        if not self._is_mega_map(getattr(self.tilemap, "map_id", None)):
+            return True
+        return self._camera_world_rect(margin).collidepoint(int(point[0]), int(point[1]))
+
     def _spawn_offline_ally_bots(self) -> list[Soldier]:
         # Mega maps dùng đội hình đồng minh lớn hơn để bớt "ngu" do thiếu quân số.
         total_bots = 6 if self._is_mega_map(self.tilemap.map_id) else 3
@@ -213,6 +244,7 @@ class Game:
             spawn_tile = self._player_spawn_tile(i + 1)
             bot = Soldier(self.tilemap.spawn_position(spawn_tile), is_player=False, team="player", bot_name=f"Bot {i + 1}")
             bot.speed = self.player.speed * 0.97
+            self._apply_ally_upgrade(bot)
             allies.append(bot)
         return allies
 
@@ -299,8 +331,11 @@ class Game:
         self.tilemap = TileMap(requested_map)
         self.camera = Camera(self.tilemap.width, self.tilemap.height)
         spawns = self.tilemap.spawns
+        self.equipped_primary = "ak47"
+        self.equipped_sidearm = "ak47"
+        self.weapon_mode = "ak47"
         self.player = Soldier(self.tilemap.spawn_position(spawns["player"]), is_player=True, bot_name=getattr(self, "player_name", "Player"))
-        self.player.weapon_pose = WEAPONS.get(self.weapon_mode, WEAPONS["rifle"]).animation_key
+        self.player.weapon_pose = WEAPONS.get(self.weapon_mode, WEAPONS["ak47"]).animation_key
 
         self.ally_bots = []
         if getattr(self, "game_mode", "campaign") == "pvp":
@@ -331,6 +366,7 @@ class Game:
         self.melee_swings = []
         self.floaters: list[tuple[str, pygame.Vector2, tuple[int, int, int], float]] = []
         self.mortar_cooldown = 0.0
+        self.airstrike_cooldown = 0.0
         self.particles = ParticleSystem()
         self.sync_events = []
         self.effects = CombatEffects(self.particles, self.sync_events)
@@ -344,6 +380,8 @@ class Game:
             TankVehicle(self.tilemap.spawn_position(pos), self._enemy_tank_kind(index), faction="enemy")
             for index, pos in enumerate(spawns["tanks"])
         ]
+        if not self.is_online_pvp() and getattr(self, "network_mode", "offline") != "client":
+            self.enemy_vehicles.extend(self._spawn_escalation_boss_tanks(spawns))
         self.ally_vehicle_bots = self._spawn_ally_tank_bots(spawns)
         self.vehicles = self._spawn_player_vehicles()
         self.vehicles.extend(self.ally_vehicle_bots)
@@ -384,7 +422,33 @@ class Game:
                     str(run.get("unit", "bomber")),
                 )
             )
+        extra_count = self._mega_escalation_count()
+        if extra_count:
+            width_tiles = max(1, self.tilemap.width // TILE_SIZE)
+            height_tiles = max(1, self.tilemap.height // TILE_SIZE)
+            target = self.tilemap.world_to_tile(self.tilemap.capture_rect.center)
+            for index in range(extra_count):
+                entry = (2 + (index * 19) % max(3, width_tiles - 4), 2)
+                exit = (width_tiles - 3 - (index * 23) % max(3, width_tiles - 4), height_tiles - 3)
+                target_tile = (
+                    max(1, min(width_tiles - 2, target[0] + (index % 3 - 1) * 9)),
+                    max(1, min(height_tiles - 2, target[1] + (index // 3 - 1) * 7)),
+                )
+                aircraft.append(
+                    EnemyAircraft(
+                        self.tilemap.tile_center(entry),
+                        self.tilemap.tile_center(exit),
+                        self.tilemap.tile_center(target_tile),
+                        "bomber",
+                    )
+                )
         return aircraft
+
+    def _mega_escalation_count(self, map_id: str | None = None) -> int:
+        map_id = map_id or getattr(self.tilemap, "map_id", self.current_map_id)
+        if map_id not in MEGA_ESCALATION_MAPS:
+            return 0
+        return 2 + MEGA_ESCALATION_MAPS.index(map_id)
 
     def _load_sounds(self) -> dict[str, pygame.mixer.Sound]:
         sounds = {}
@@ -399,21 +463,31 @@ class Game:
         return sounds
 
     def _load_campaign(self) -> CampaignState:
-        if not SAVE_PATH.exists():
-            return CampaignState(credits=99999)
+        save_path = self._save_path()
+        if not save_path.exists():
+            return CampaignState(credits=DEFAULT_CREDITS)
         try:
-            state = CampaignState.from_dict(json.loads(SAVE_PATH.read_text(encoding="utf-8")))
-            state.credits = max(state.credits, 99999)
+            state = CampaignState.from_dict(json.loads(save_path.read_text(encoding="utf-8")))
             return state
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return CampaignState(credits=99999)
+            return CampaignState(credits=DEFAULT_CREDITS)
 
     def save_campaign(self) -> None:
         try:
-            SAVE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SAVE_PATH.write_text(json.dumps(self.campaign.to_dict(), indent=2), encoding="utf-8")
+            save_path = self._save_path()
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_text(json.dumps(self.campaign.to_dict(), indent=2), encoding="utf-8")
         except OSError:
             self.add_radio("SAVE FAILED", (255, 118, 100), 4.0)
+
+    def _save_path(self) -> Path:
+        return SAVE_DIR / f"save_{self._profile_id()}.json"
+
+    def _profile_id(self) -> str:
+        raw = (getattr(self, "player_name", "") or "player").strip().lower()
+        clean = "".join(ch if ch.isalnum() else "_" for ch in raw)
+        clean = "_".join(part for part in clean.split("_") if part)
+        return clean[:24] or "player"
 
     def _play_sound(self, name: str) -> None:
         sound = self.sounds.get(name)
@@ -427,11 +501,17 @@ class Game:
             "trench_line": "trench_line.wav",
             "river_bridge": "river_bridge.wav",
             "armored_front": "armored_front.wav",
+            "jungle_outpost_mega": "jungle_outpost_mega.wav",
+            "trench_line_mega": "trench_line_mega.wav",
+            "river_bridge_mega": "river_bridge_mega.wav",
+            "armored_front_mega": "armored_front_mega.wav",
         }
         music_dir = ASSET_DIR / "audio" / "music"
+        fallback_music = music_dir / "placeholder_loop.wav"
         candidates = []
         if map_id in music_files:
             candidates.append(music_dir / music_files[map_id])
+        candidates.append(fallback_music)
         candidates.extend(music_dir / filename for filename in music_files.values())
         music_path = next((path for path in candidates if path.exists()), None)
 
@@ -473,6 +553,27 @@ class Game:
         vehicle.rect.center = self.tilemap.tile_center(spawn_tile)
         return [vehicle]
 
+    def _spawn_escalation_boss_tanks(self, spawns: dict) -> list[TankVehicle]:
+        count = self._mega_escalation_count()
+        if count <= 0:
+            return []
+        tank_tiles = [tuple(tile) for tile in spawns.get("tanks", [])]
+        if not tank_tiles:
+            tank_tiles = [tuple(pos) for pos in spawns.get("enemies", [])]
+        if not tank_tiles:
+            return []
+        bosses: list[TankVehicle] = []
+        stride = max(1, len(tank_tiles) // count)
+        for index in range(count):
+            tile = tank_tiles[(index * stride + index) % len(tank_tiles)]
+            boss = TankVehicle(self.tilemap.spawn_position(tile), "super_heavy", faction="enemy")
+            boss.rect.center = self.tilemap.tile_center(tile)
+            boss.max_hp = int(boss.max_hp * 1.25)
+            boss.hp = boss.max_hp
+            boss.damage = getattr(boss, "damage", boss.stats.damage)
+            bosses.append(boss)
+        return bosses
+
     @staticmethod
     def _enemy_tank_kind(index: int) -> str:
         return ("light_tank", "sherman", "heavy_tank")[index % 3]
@@ -511,8 +612,7 @@ class Game:
         return None
 
     def _weapon_for_session(self, session: dict):
-        weapon_id = session.get("weapon_mode") or session.get("primary") or "rifle"
-        return WEAPONS.get(weapon_id, WEAPONS["rifle"])
+        return WEAPONS["ak47"]
 
     def _apply_weapon_to_bullet(self, bullet, definition, owner_team: str) -> None:
         bullet.damage = definition.damage + self.weapon_damage_bonus()
@@ -619,6 +719,12 @@ class Game:
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_F11:
                     self.toggle_fullscreen()
+                if event.key == pygame.K_F12:
+                    import os, datetime
+                    os.makedirs("screenshots", exist_ok=True)
+                    fname = datetime.datetime.now().strftime("screenshots/screenshot_%Y%m%d_%H%M%S.png")
+                    pygame.image.save(self.screen, fname)
+                    print(f"Saved screenshot to {fname}")
                 if self.state in ("title", "name_input", "ip_input", "pvp_menu", "lobby") and event.key == pygame.K_ESCAPE:
                     if self.state in ("pvp_menu", "lobby"):
                         self.state = "title"
@@ -639,6 +745,7 @@ class Game:
                     continue
                 if self.state == "name_input":
                     if event.key == pygame.K_RETURN and self.player_name.strip():
+                        self.campaign = self._load_campaign()
                         self.state = "title"
                     elif event.key == pygame.K_BACKSPACE:
                         self.player_name = self.player_name[:-1]
@@ -675,8 +782,14 @@ class Game:
                     continue
 
                 if self.state == "menu" and event.key == pygame.K_ESCAPE:
-                    self.state = "title"
+                    if self.code_active:
+                        self.code_active = False
+                    else:
+                        self.state = "title"
                     self._play_sound("menu_select")
+                if self.state == "menu" and self.menu_tab == "shop" and self.code_active:
+                    self._handle_shop_code_key(event)
+                    continue
                 if self.state == "title" and event.key in (pygame.K_DOWN, pygame.K_s):
                     self.title_selection = (self.title_selection + 1) % len(self._title_actions())
                     self._play_sound("menu_select")
@@ -728,7 +841,7 @@ class Game:
                     elif event.key == pygame.K_1:
                         self.weapon_mode = self.equipped_primary
                     elif event.key == pygame.K_2:
-                        self.weapon_mode = self.equipped_sidearm
+                        self.weapon_mode = self.equipped_primary
                     elif event.key == pygame.K_3:
                         self.swing_gun_bash(self.camera.world_mouse(pygame.mouse.get_pos()))
                     elif event.key == pygame.K_m:
@@ -755,7 +868,7 @@ class Game:
                         bullet.speed = definition.bullet_speed
                         bullet.armor_piercing = definition.armor_piercing
                         bullet.life = max(0.35, definition.range_px / max(1, definition.bullet_speed))
-                        bullet.weapon = "rifle"
+                        bullet.weapon = definition.id
                         bullet.owner_team = self._actor_team(actor)
                         actor.reload = definition.cooldown * self.weapon_cooldown_scale()
                         if definition.recoil_shake:
@@ -1055,7 +1168,9 @@ class Game:
                 return
 
     def start_selected_map(self) -> None:
-        self.weapon_mode = self.equipped_primary
+        self.equipped_primary = "ak47"
+        self.equipped_sidearm = "ak47"
+        self.weapon_mode = "ak47"
         self.reset(self.current_map_id)
         chapter = CHAPTERS_BY_MAP.get(self.tilemap.map_id)
         if (
@@ -1074,13 +1189,26 @@ class Game:
             self.network_server.broadcast_state({"status": "playing", "map_id": self.current_map_id, "game_mode": getattr(self, "game_mode", "campaign")})
 
     def active_weapon(self):
-        return WEAPONS.get(self.weapon_mode, WEAPONS["rifle"])
+        return WEAPONS["ak47"]
 
     def weapon_damage_bonus(self) -> int:
-        return self.campaign.purchases.get("weapon_training", 0) * 4
+        return self.ak_damage() - AK_BASE_DAMAGE
+
+    def ak_damage(self) -> int:
+        level = max(0, min(UPGRADE_LEVELS, self.campaign.purchases.get("weapon_training", 0)))
+        return AK_BASE_DAMAGE + round((AK_MAX_DAMAGE - AK_BASE_DAMAGE) * level / UPGRADE_LEVELS)
+
+    def ally_bot_damage(self) -> int:
+        level = max(0, min(UPGRADE_LEVELS, self.campaign.purchases.get("ally_training", 0)))
+        return AK_BASE_DAMAGE + round((AK_MAX_DAMAGE - AK_BASE_DAMAGE) * level / UPGRADE_LEVELS)
+
+    def _apply_ally_upgrade(self, bot: Soldier) -> None:
+        bot.damage_amount = self.ally_bot_damage()
+        bot.weapon_pose = "rifle"
+        bot.weapon_range = max(bot.weapon_range, WEAPONS["ak47"].range_px)
 
     def weapon_cooldown_scale(self) -> float:
-        return max(0.62, 1.0 - self.campaign.purchases.get("reload_drill", 0) * 0.07)
+        return 1.0
 
     def handle_lobby_click(self, pos: tuple[int, int]) -> None:
         for rect, action in self.lobby_buttons:
@@ -1121,6 +1249,15 @@ class Game:
                     self.shop_filter = action.split(":", 1)[1]
                     self.shop_page = 0
                     self._play_sound("menu_select")
+                elif action == "code_focus":
+                    self.code_active = True
+                    self._play_sound("menu_select")
+                elif action == "code_submit":
+                    self.apply_code()
+                elif action == "tank_toggle":
+                    self.toggle_tank_purchase()
+                elif action.startswith("downgrade:"):
+                    self.downgrade_upgrade(action.split(":", 1)[1])
                 elif action == "title":
                     self.state = "title"
                 elif action == "back_lobby":
@@ -1131,6 +1268,71 @@ class Game:
                     # coming from lobby, start game
                     self.previous_state = "title"
                     self.start_selected_map()
+
+    def _handle_shop_code_key(self, event) -> None:
+        if event.key == pygame.K_RETURN:
+            self.apply_code()
+            return
+        if event.key == pygame.K_BACKSPACE:
+            self.code_entry = self.code_entry[:-1]
+            return
+        if event.key == pygame.K_ESCAPE:
+            self.code_active = False
+            return
+        if len(self.code_entry) < 18 and event.unicode.isprintable():
+            self.code_entry += event.unicode
+
+    def apply_code(self) -> None:
+        code = self.code_entry.strip().lower()
+        if code == "admin":
+            self.campaign.credits = max(self.campaign.credits, 99999)
+            self.code_notice = "Code dung: tien test = 99999"
+            self.code_entry = ""
+            self.code_active = False
+            self.save_campaign()
+            self._play_sound("pickup")
+        elif code:
+            self.code_notice = "CODE SAI"
+            self._play_sound("hit")
+
+    def toggle_tank_purchase(self) -> None:
+        item = SHOP_ITEMS["tank"]
+        if self.campaign.purchases.get("tank", 0) > 0:
+            self.campaign.purchases["tank"] = 0
+            self.campaign.credits += item.cost
+            if getattr(self, "player", None) and getattr(self.player, "vehicle", None):
+                self.player.vehicle.exit()
+            self.vehicles = [vehicle for vehicle in getattr(self, "vehicles", []) if vehicle in getattr(self, "ally_vehicle_bots", [])]
+            self.code_notice = f"Đã tắt xe tăng, hoàn {item.cost}c"
+            self.save_campaign()
+            self._play_sound("pickup")
+            return
+        if self.campaign.buy("tank"):
+            self.code_notice = "Đã bật xe tăng"
+            if self.state == "play":
+                self.vehicles = self._spawn_player_vehicles()
+                self.vehicles.extend(getattr(self, "ally_vehicle_bots", []))
+            self.save_campaign()
+            self._play_sound("pickup")
+
+    def downgrade_upgrade(self, item_id: str) -> None:
+        if item_id not in {"weapon_training", "ally_training"}:
+            return
+        current = self.campaign.purchases.get(item_id, 0)
+        if current <= 0:
+            return
+        item = SHOP_ITEMS[item_id]
+        self.campaign.purchases[item_id] = current - 1
+        self.campaign.credits += item.cost
+        if self.campaign.purchases[item_id] <= 0:
+            self.campaign.purchases.pop(item_id, None)
+        if item_id == "ally_training":
+            for bot in getattr(self, "ally_bots", []):
+                if not getattr(bot, "player_controlled", False):
+                    self._apply_ally_upgrade(bot)
+        self.code_notice = f"Da giam {item.name}, hoan {item.cost}c"
+        self.save_campaign()
+        self._play_sound("pickup")
 
     def handle_result_click(self, pos: tuple[int, int]) -> None:
         for rect, action in self.result_buttons:
@@ -1163,6 +1365,9 @@ class Game:
             return
 
     def buy_shop_item(self, item_id: str) -> None:
+        if item_id == "tank":
+            self.toggle_tank_purchase()
+            return
         if not self.campaign.buy(item_id):
             return
         item = SHOP_ITEMS[item_id]
@@ -1184,6 +1389,7 @@ class Game:
         self._play_sound("pickup")
 
     def equip_weapon(self, item_id: str) -> None:
+        item_id = "ak47"
         weapon = WEAPONS.get(item_id)
         if weapon is None:
             return
@@ -1234,6 +1440,7 @@ class Game:
             self.camera.follow(self.active_actor.rect, self.screen.get_size(), dt)
         self.mission_grace = max(0.0, self.mission_grace - dt)
         self.mortar_cooldown = max(0.0, self.mortar_cooldown - dt)
+        self.airstrike_cooldown = max(0.0, self.airstrike_cooldown - dt)
         self.melee_swings = [(pos, angle, life - dt) for pos, angle, life in self.melee_swings if life > dt]
         self.radio_log = [(text, color, life - dt) for text, color, life in self.radio_log if life > dt]
 
@@ -1245,15 +1452,21 @@ class Game:
         if self.mission_started and not is_client:
             self.ai_timer -= dt
             if self.ai_timer <= 0:
-                self.ai_timer = 0.25
+                mega_map = self._is_mega_map(self.tilemap.map_id)
+                self.ai_timer = 0.65 if mega_map else 0.25
                 target_tile = self.tilemap.world_to_tile(self.active_actor.rect.center)
+                target_center = pygame.Vector2(self.active_actor.rect.center)
+                max_path_dist_sq = 2600 * 2600 if mega_map else float("inf")
+                max_path_nodes = 2800 if mega_map else None
                 self.enemy_paths = {}
                 for enemy in [*self.enemies, *self.enemy_vehicles]:
+                    if pygame.Vector2(enemy.rect.center).distance_squared_to(target_center) > max_path_dist_sq:
+                        continue
                     enemy_tile = self.tilemap.world_to_tile(enemy.rect.center)
-                    path = astar(enemy_tile, target_tile, self.passable_grid)
+                    path = astar(enemy_tile, target_tile, self.passable_grid, max_nodes=max_path_nodes)
                     if not path:
                         nearby_goal = bfs_nearest(enemy_tile, [target_tile], self.passable_grid)
-                        path = astar(enemy_tile, nearby_goal, self.passable_grid) if nearby_goal else []
+                        path = astar(enemy_tile, nearby_goal, self.passable_grid, max_nodes=max_path_nodes) if nearby_goal else []
                     self.enemy_paths[id(enemy)] = path
                 hostile_targets = [*self.enemies, *self.enemy_vehicles]
                 self.ally_paths = {}
@@ -1263,27 +1476,34 @@ class Game:
                         continue
                     if hostile_targets:
                         nearest = min(hostile_targets, key=lambda e: pygame.Vector2(bot.rect.center).distance_to(e.rect.center))
+                        if pygame.Vector2(bot.rect.center).distance_squared_to(nearest.rect.center) > max_path_dist_sq:
+                            continue
                         bot_tile = self.tilemap.world_to_tile(bot.rect.center)
                         goal_tile = self.tilemap.world_to_tile(nearest.rect.center)
-                        path = astar(bot_tile, goal_tile, self.passable_grid)
+                        path = astar(bot_tile, goal_tile, self.passable_grid, max_nodes=max_path_nodes)
                         if not path:
                             nearby_goal = bfs_nearest(bot_tile, [goal_tile], self.passable_grid)
-                            path = astar(bot_tile, nearby_goal, self.passable_grid) if nearby_goal else []
+                            path = astar(bot_tile, nearby_goal, self.passable_grid, max_nodes=max_path_nodes) if nearby_goal else []
                         self.ally_paths[id(bot)] = path
                 for vehicle in getattr(self, "ally_vehicle_bots", []):
                     if not vehicle.alive or vehicle.occupied:
                         continue
                     if hostile_targets:
                         nearest = min(hostile_targets, key=lambda e: pygame.Vector2(vehicle.rect.center).distance_to(e.rect.center))
+                        if pygame.Vector2(vehicle.rect.center).distance_squared_to(nearest.rect.center) > max_path_dist_sq:
+                            continue
                         vehicle_tile = self.tilemap.world_to_tile(vehicle.rect.center)
                         goal_tile = self.tilemap.world_to_tile(nearest.rect.center)
-                        path = astar(vehicle_tile, goal_tile, self.passable_grid)
+                        path = astar(vehicle_tile, goal_tile, self.passable_grid, max_nodes=max_path_nodes)
                         if not path:
                             nearby_goal = bfs_nearest(vehicle_tile, [goal_tile], self.passable_grid)
-                            path = astar(vehicle_tile, nearby_goal, self.passable_grid) if nearby_goal else []
+                            path = astar(vehicle_tile, nearby_goal, self.passable_grid, max_nodes=max_path_nodes) if nearby_goal else []
                         self.ally_vehicle_paths[id(vehicle)] = path
 
             for enemy in self.enemies:
+                if not self._rect_in_camera_load(enemy.rect):
+                    enemy._tick_timers(dt)
+                    continue
                 if self.mission_grace > 0:
                     enemy.reload = max(enemy.reload, self.mission_grace)
                 # Enemies target the nearest human player (host or any client bot)
@@ -1302,6 +1522,9 @@ class Game:
 
             for bot in getattr(self, "ally_bots", []):
                 if not getattr(bot, "player_controlled", False):
+                    if not self._rect_in_camera_load(bot.rect):
+                        bot._tick_timers(dt)
+                        continue
                     self.bullets.extend(
                         bot.update_bot(
                             dt,
@@ -1371,7 +1594,8 @@ class Game:
                         was_alive = hit_target.alive
                         actual = hit_target.damage(bullet.damage, bullet.armor_piercing)
                         self.add_floater(f"-{actual}", hit_target.rect.center, (255, 118, 100))
-                        self.effects.bullet_hit(bullet.pos, bullet.weapon)
+                        effect_weapon = "tank" if isinstance(hit_target, TankVehicle) else "rifle"
+                        self.effects.bullet_hit(bullet.pos, effect_weapon)
                         self._play_sound("hit")
                         self.camera.shake(0.8, 0.12)
                         if was_alive and not hit_target.alive and isinstance(hit_target, TankVehicle):
@@ -1383,12 +1607,12 @@ class Game:
                         was_alive = hit.alive
                         actual = hit.damage(bullet.damage, bullet.armor_piercing)
                         self.add_floater(f"-{actual}", hit.rect.center, (255, 214, 118))
-                        self.effects.bullet_hit(bullet.pos, bullet.weapon)
+                        self.effects.bullet_hit(bullet.pos, "rifle")
                         self._play_sound("hit")
                         if was_alive and not hit.alive:
                             self.register_kill("inf")
                             self.corpses.append((hit._current_sprite(), hit.rect.copy(), 3.0))
-                            self.effects.soldier_death_smoke(hit.rect.center, bullet.weapon)
+                            self.effects.soldier_death_smoke(hit.rect.center, "rifle")
                             self.camera.shake(0.45, 0.08)
                             self.add_radio("INFANTRY DOWN", (255, 214, 118))
                         continue
@@ -1417,7 +1641,8 @@ class Game:
                     if hit_target:
                         actual = hit_target.damage(bullet.damage, bullet.armor_piercing)
                         self.add_floater(f"-{actual}", hit_target.rect.center, (255, 118, 100))
-                        self.effects.bullet_hit(bullet.pos, bullet.weapon)
+                        effect_weapon = "tank" if isinstance(hit_target, TankVehicle) else "rifle"
+                        self.effects.bullet_hit(bullet.pos, effect_weapon)
                         self._play_sound("hit")
                         self.camera.shake(0.8, 0.12)
                         continue
@@ -1995,6 +2220,9 @@ class Game:
         target = self.active_actor
         for vehicle in self.enemy_vehicles:
             vehicle.moving = False
+            if not self._rect_in_camera_load(vehicle.rect):
+                vehicle.update(dt)
+                continue
             to_target = pygame.Vector2(target.rect.center) - pygame.Vector2(vehicle.rect.center)
             distance = to_target.length()
             path = self.enemy_paths.get(id(vehicle))
@@ -2045,6 +2273,9 @@ class Game:
             if not vehicle.alive or vehicle.occupied:
                 continue
             vehicle.moving = False
+            if not self._rect_in_camera_load(vehicle.rect):
+                vehicle.update(dt)
+                continue
             target = min(hostile_targets, key=lambda e: pygame.Vector2(vehicle.rect.center).distance_to(e.rect.center))
             to_target = pygame.Vector2(target.rect.center) - pygame.Vector2(vehicle.rect.center)
             distance = to_target.length()
@@ -2074,11 +2305,19 @@ class Game:
                     self._play_sound("tank_fire")
 
     def update_enemy_aircraft(self, dt: float) -> None:
+        dropped_bomb = False
         for aircraft in self.enemy_aircraft:
+            if not self._rect_in_camera_load(aircraft.rect, margin=1200):
+                continue
             target = aircraft.update(dt, self.active_actor.rect.center)
             if target is None or self.mission_grace > 0:
                 continue
+            if dropped_bomb or self.airstrike_cooldown > 0:
+                aircraft.bomb_cooldown = max(aircraft.bomb_cooldown, random.uniform(1.8, 3.4))
+                continue
             self.enemy_airstrike(target, aircraft)
+            self.airstrike_cooldown = 1.25 if self._is_mega_map(self.tilemap.map_id) else 0.75
+            dropped_bomb = True
 
     def _update_offline_pvp_bot_items(self, dt: float) -> None:
         if getattr(self, "game_mode", "campaign") != "pvp" or self.is_online() or not self.enemies:
@@ -2128,8 +2367,8 @@ class Game:
     def enemy_air_bomb_detonate(self, target) -> None:
         target = pygame.Vector2(target)
         direction = pygame.Vector2(self.active_actor.rect.center) - target
-        self.effects.bomber_strike_effect(target, direction, 1.05)
-        self.camera.shake(1.7, 0.24)
+        self.effects.bomber_strike_effect(target, direction, 0.72 if self._is_mega_map(self.tilemap.map_id) else 0.9)
+        self.camera.shake(1.05 if self._is_mega_map(self.tilemap.map_id) else 1.4, 0.18)
         if pygame.Vector2(self.active_actor.rect.center).distance_to(target) <= 125:
             self.active_actor.damage(UNIT_STATS["bomber"].damage, 28)
         for vehicle in self.vehicles:
@@ -2343,21 +2582,26 @@ class Game:
         self.tilemap.draw(self.screen, self.camera)
         self._draw_capture_zone()
         for item in self.items:
-            item.draw(self.screen, self.camera)
+            if self._rect_in_camera_load(item.rect, margin=160):
+                item.draw(self.screen, self.camera)
         self._draw_nearest_item_hint()
         for bullet in self.bullets:
-            bullet.draw(self.screen, self.camera)
+            if self._point_in_camera_load(bullet.pos, margin=120):
+                bullet.draw(self.screen, self.camera)
         for grenade in self.grenades:
-            grenade.draw(self.screen, self.camera)
+            if self._point_in_camera_load(grenade.pos, margin=180):
+                grenade.draw(self.screen, self.camera)
         for shell in self.mortar_shells:
-            shell.draw(self.screen, self.camera)
+            if self._point_in_camera_load(shell.pos, margin=220):
+                shell.draw(self.screen, self.camera)
         self._draw_melee_swings()
         self._draw_corpses()
         actors = [*self.enemies, *self.enemy_vehicles, *self.vehicles, *self.enemy_aircraft, *getattr(self, "ally_bots", [])]
         if not getattr(self.player, "vehicle", None):
             actors.append(self.player)
         for entity in sorted(actors, key=lambda item: item.rect.centery):
-            entity.draw(self.screen, self.camera)
+            if self._rect_in_camera_load(entity.rect, margin=220):
+                entity.draw(self.screen, self.camera)
         self.particles.draw(self.screen, self.camera)
         self._draw_floaters()
         self._draw_objective_pointer()
@@ -2570,8 +2814,8 @@ class Game:
         header = self.font.render("KHO VŨ KHÍ HIỆN TẠI", True, (245, 232, 184))
         self.screen.blit(header, (panel.left + 28, panel.top + 88))
         lines = [
-            f"Súng chính: {weapon_name(self.equipped_primary)}",
-            f"Súng phụ: {weapon_name(self.equipped_sidearm)}",
+            f"Vũ khí: AK-47 cấp {self.campaign.purchases.get('weapon_training', 0)}/{UPGRADE_LEVELS} - {self.ak_damage()} damage",
+            f"Bot đồng minh: cấp {self.campaign.purchases.get('ally_training', 0)}/{UPGRADE_LEVELS} - {self.ally_bot_damage()} damage",
             "Cận chiến: đánh bằng báng súng",
             f"Vật phẩm: {self.inventory.medkits} medkit / {self.inventory.grenades} lựu / {self.inventory.ammo} đạn",
             f"Ngân sách: {self.campaign.credits} credits",
@@ -2615,6 +2859,7 @@ class Game:
 
         if self.menu_tab == "shop":
             self._draw_loadout_preview(preview)
+            self._draw_shop_code_box()
         else:
             current_data = MAPS[self.current_map_id]
             preview_title = self.font.render(current_data["title"], True, (245, 232, 184))
@@ -2680,8 +2925,7 @@ class Game:
             stats = self.small_font.render(self._fit_text(self._mission_stats(data), self.small_font, 176), True, (228, 205, 126))
             brief_text = self._fit_text(data["briefing"], self.small_font, rect.width - 66 - stats.get_width() - 18)
             brief = self.small_font.render(brief_text, True, (200, 207, 180))
-            icon = pygame.transform.smoothscale(self.assets.icons["objective"], (26, 26))
-            self.screen.blit(icon, (rect.left + 16, rect.top + 12))
+            self.screen.blit(self._objective_icon_small, (rect.left + 16, rect.top + 12))
             self.screen.blit(name, (rect.left + 52, rect.top + 5))
             self.screen.blit(brief, (rect.left + 52, rect.top + 29))
             self.screen.blit(stats, (rect.right - stats.get_width() - 12, rect.top + 29))
@@ -2717,18 +2961,17 @@ class Game:
     def _draw_loadout_preview(self, panel: pygame.Rect) -> None:
         title = self.font.render("LOADOUT BOARD", True, (245, 232, 184))
         self.screen.blit(title, (panel.left + 24, panel.top + 18))
-        budget = self.small_font.render(f"Credits {self.campaign.credits}  |  Ammo {self.inventory.ammo}", True, (238, 203, 116))
+        budget = self.small_font.render(f"Credits {self.campaign.credits}  |  Ammo {self.inventory.ammo}  |  AK D{self.ak_damage()}  Bot D{self.ally_bot_damage()}", True, (238, 203, 116))
         self.screen.blit(budget, (panel.left + 24, panel.top + 47))
         hint = self.small_font.render(
-            self._fit_text("Click item to buy/equip. Use filters.", self.small_font, panel.width - 48),
+            self._fit_text("AK only. Buy upgrades, supplies, armor, and tank support.", self.small_font, panel.width - 48),
             True,
             (189, 204, 168),
         )
         self.screen.blit(hint, (panel.left + 24, panel.top + 66))
 
         cards = [
-            ("PRIMARY", self.equipped_primary, pygame.Rect(panel.left + 24, panel.top + 96, panel.width - 48, 100)),
-            ("SIDEARM", self.equipped_sidearm, pygame.Rect(panel.left + 24, panel.top + 210, panel.width - 48, 100)),
+            ("PRIMARY", "ak47", pygame.Rect(panel.left + 24, panel.top + 96, panel.width - 48, 100)),
         ]
         for label, weapon_id, rect in cards:
             weapon = WEAPONS.get(weapon_id, WEAPONS["rifle"])
@@ -2744,12 +2987,12 @@ class Game:
             name = self.font.render(self._fit_text(weapon.name, self.font, rect.width - 112), True, (245, 232, 184))
             self.screen.blit(name, (rect.left + 92, rect.top + 10))
             meta = self.small_font.render(
-                f"DMG {weapon.damage}  RNG {weapon.range_px}  AP {weapon.armor_piercing}",
+                f"DMG {self.ak_damage()}  RNG {weapon.range_px}  AP {weapon.armor_piercing}",
                 True,
                 (200, 207, 180),
             )
             self.screen.blit(meta, (rect.left + 92, rect.top + 35))
-            self._draw_weapon_stat_bars(weapon, pygame.Rect(rect.left + 92, rect.top + 58, rect.width - 110, 38))
+            self._draw_weapon_stat_bars(weapon, pygame.Rect(rect.left + 92, rect.top + 58, rect.width - 110, 38), self.ak_damage())
 
         supply_rect = pygame.Rect(panel.left + 24, panel.bottom - 42, panel.width - 48, 26)
         pygame.draw.rect(self.screen, (31, 43, 36), supply_rect, border_radius=5)
@@ -2761,9 +3004,10 @@ class Game:
         )
         self.screen.blit(supply, supply.get_rect(center=supply_rect.center))
 
-    def _draw_weapon_stat_bars(self, weapon, rect: pygame.Rect) -> None:
+    def _draw_weapon_stat_bars(self, weapon, rect: pygame.Rect, damage: int | None = None) -> None:
+        damage = weapon.damage if damage is None else damage
         stats = [
-            ("DMG", weapon.damage / 140),
+            ("DMG", damage / AK_MAX_DAMAGE),
             ("ROF", min(1.0, weapon.shots_per_second / 8)),
             ("RNG", weapon.range_px / 980),
             ("STB", 1.0 - min(1.0, weapon.spread_degrees / 14)),
@@ -2810,7 +3054,7 @@ class Game:
     def _draw_shop_panel(self, panel: pygame.Rect) -> None:
         credits = self.font.render(f"Credits: {self.campaign.credits}", True, (238, 203, 116))
         self.screen.blit(credits, (panel.left + 28, panel.top + 24))
-        equipped = self.small_font.render(f"Đang dùng: {weapon_name(self.equipped_primary)} / {weapon_name(self.equipped_sidearm)}", True, (189, 204, 168))
+        equipped = self.small_font.render(f"Đang dùng: AK-47 D{self.ak_damage()} | Bot D{self.ally_bot_damage()}", True, (189, 204, 168))
         self.screen.blit(equipped, (panel.left + 28, panel.top + 50))
         self._draw_shop_filters(panel)
 
@@ -2862,7 +3106,14 @@ class Game:
             desc = self.small_font.render(self._fit_text(self._shop_description(item_id, item.description), self.small_font, rect.right - text_x - 8), True, (200, 207, 180))
             self.screen.blit(name, (text_x, rect.top + 4))
             self.screen.blit(desc, (text_x, rect.top + 28))
-            self.menu_buttons.append((rect, f"equip:{item_id}" if owned and item.kind == "weapon" else f"buy:{item_id}"))
+            if item_id in {"weapon_training", "ally_training"} and bought_count > 0:
+                minus_rect = pygame.Rect(rect.right - 34, rect.top + 6, 24, 20)
+                self._draw_3d_button(minus_rect, (82, 46, 39), (226, 196, 82), hot=minus_rect.collidepoint(pygame.mouse.get_pos()), depth=2, radius=4)
+                minus = self.small_font.render("-", True, (255, 230, 180))
+                self.screen.blit(minus, minus.get_rect(center=minus_rect.center))
+                self.menu_buttons.append((minus_rect, f"downgrade:{item_id}"))
+            action = "tank_toggle" if item_id == "tank" else (f"equip:{item_id}" if owned and item.kind == "weapon" else f"buy:{item_id}")
+            self.menu_buttons.append((rect, action))
 
         nav_y = panel.bottom - 44
         page_label = self.small_font.render(f"Trang {self.shop_page + 1}/{pages}", True, (238, 203, 116))
@@ -2877,6 +3128,22 @@ class Game:
             self._draw_3d_button(next_rect, (35, 48, 40), (226, 196, 82), hot=next_rect.collidepoint(pygame.mouse.get_pos()), depth=4)
             self.screen.blit(self.small_font.render("Tiếp >", True, (245, 232, 184)), (next_rect.left + 14, next_rect.top + 7))
             self.menu_buttons.append((next_rect, f"shop_page:{self.shop_page + 1}"))
+
+    def _draw_shop_code_box(self) -> None:
+        code_rect = pygame.Rect(SCREEN_WIDTH - 284, 16, 170, 30)
+        submit_rect = pygame.Rect(SCREEN_WIDTH - 106, 16, 74, 30)
+        self._draw_3d_button(code_rect, (42, 58, 45) if self.code_active else (31, 43, 36), (238, 203, 116) if self.code_active else (78, 92, 73), active=self.code_active, hot=code_rect.collidepoint(pygame.mouse.get_pos()), depth=3)
+        code_text = self.code_entry if self.code_entry else "nhập code"
+        color = (245, 232, 184) if self.code_entry else (145, 153, 132)
+        self.screen.blit(self.small_font.render(self._fit_text(code_text, self.small_font, code_rect.width - 18), True, color), (code_rect.left + 9, code_rect.top + 7))
+        self._draw_3d_button(submit_rect, (45, 86, 54), (238, 203, 116), hot=submit_rect.collidepoint(pygame.mouse.get_pos()), depth=3)
+        ok = self.small_font.render("OK", True, (245, 232, 184))
+        self.screen.blit(ok, ok.get_rect(center=submit_rect.center))
+        self.menu_buttons.append((code_rect, "code_focus"))
+        self.menu_buttons.append((submit_rect, "code_submit"))
+        if self.code_notice:
+            notice = self.small_font.render(self._fit_text(self.code_notice, self.small_font, 250), True, (238, 203, 116))
+            self.screen.blit(notice, (code_rect.left, code_rect.bottom + 6))
 
     def _draw_shop_filters(self, panel: pygame.Rect) -> None:
         filters = [
@@ -2916,6 +3183,12 @@ class Game:
         return True
 
     def _shop_description(self, item_id: str, fallback: str) -> str:
+        if item_id == "weapon_training":
+            return f"AK damage hiện tại {self.ak_damage()} / {AK_MAX_DAMAGE}"
+        if item_id == "ally_training":
+            return f"Bot damage hiện tại {self.ally_bot_damage()} / {AK_MAX_DAMAGE}"
+        if item_id == "tank":
+            return "Đang bật - click để hoàn tiền" if self.campaign.purchases.get("tank", 0) else fallback
         weapon = WEAPONS.get(item_id)
         if weapon is None or weapon.slot not in {"primary", "secondary", "sidearm", "melee", "support"}:
             return fallback
@@ -2935,19 +3208,33 @@ class Game:
             self.screen.blit(concept, (0, 0))
         else:
             self._draw_map_preview(self.screen.get_rect().inflate(90, 90), MAPS[self.current_map_id], muted=True)
-        veil = pygame.Surface(self.screen.get_size(), pygame.SRCALPHA)
-        veil.fill((8, 12, 10, 218 if concept is not None else 185))
-        self.screen.blit(veil, (0, 0))
+        self.screen.blit(self._solid_overlay(self.screen.get_size(), 218 if concept is not None else 185), (0, 0))
         scan_x = int((pygame.time.get_ticks() / 18) % (SCREEN_WIDTH + 220)) - 220
-        beam = pygame.Surface((220, SCREEN_HEIGHT), pygame.SRCALPHA)
-        for x in range(220):
-            alpha = max(0, 42 - abs(x - 110) // 3)
-            pygame.draw.line(beam, (118, 148, 98, alpha), (x, 0), (x, SCREEN_HEIGHT))
-        self.screen.blit(beam, (scan_x, 0))
+        self.screen.blit(self._menu_scan_beam(), (scan_x, 0))
         for i in range(18):
             x = (i * 97 + pygame.time.get_ticks() // 65) % SCREEN_WIDTH
             y = (i * 53) % SCREEN_HEIGHT
             pygame.draw.circle(self.screen, (116, 136, 98), (x, y), 1)
+
+    def _solid_overlay(self, size: tuple[int, int], alpha: int) -> pygame.Surface:
+        key = ("veil", size[0], size[1], alpha)
+        surface = self._menu_surface_cache.get(key)
+        if surface is None:
+            surface = pygame.Surface(size, pygame.SRCALPHA)
+            surface.fill((8, 12, 10, alpha))
+            self._menu_surface_cache[key] = surface
+        return surface
+
+    def _menu_scan_beam(self) -> pygame.Surface:
+        key = ("beam", 220, SCREEN_HEIGHT, 0)
+        surface = self._menu_surface_cache.get(key)
+        if surface is None:
+            surface = pygame.Surface((220, SCREEN_HEIGHT), pygame.SRCALPHA)
+            for x in range(220):
+                alpha = max(0, 42 - abs(x - 110) // 3)
+                pygame.draw.line(surface, (118, 148, 98, alpha), (x, 0), (x, SCREEN_HEIGHT))
+            self._menu_surface_cache[key] = surface
+        return surface
 
     def _map_access_label(self, map_id: str) -> str:
         if map_id in self.campaign.unlocked_maps:
@@ -2993,14 +3280,25 @@ class Game:
         air = len(spawns.get("aircraft_enemies", [])) + len(spawns.get("air_support", []))
         return f"{len(spawns['enemies'])} INF / {len(spawns['tanks'])} ARM" + (f" / {air} AIR" if air else "")
 
-    @staticmethod
-    def _fit_text(text: str, font: pygame.font.Font, max_width: int) -> str:
+    def _fit_text(self, text: str, font: pygame.font.Font, max_width: int) -> str:
+        cache_key = (text, id(font), max_width)
+        cached = self._fit_text_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if font.size(text)[0] <= max_width:
+            self._fit_text_cache[cache_key] = text
             return text
         ellipsis = "..."
-        while text and font.size(text + ellipsis)[0] > max_width:
-            text = text[:-1]
-        return text.rstrip() + ellipsis
+        low, high = 0, len(text)
+        while low < high:
+            mid = (low + high + 1) // 2
+            if font.size(text[:mid].rstrip() + ellipsis)[0] <= max_width:
+                low = mid
+            else:
+                high = mid - 1
+        fitted = text[:low].rstrip() + ellipsis
+        self._fit_text_cache[cache_key] = fitted
+        return fitted
 
     @staticmethod
     def _wrap_text(text: str, font: pygame.font.Font, max_width: int) -> list[str]:
@@ -3072,24 +3370,30 @@ class Game:
         depth: int = 6,
         radius: int = 8,
     ) -> None:
-        shadow = pygame.Surface((rect.width + 12, rect.height + depth + 12), pygame.SRCALPHA)
-        pygame.draw.rect(shadow, (0, 0, 0, 120), pygame.Rect(6, depth + 6, rect.width, rect.height), border_radius=radius)
-        self.screen.blit(shadow, (rect.left - 6, rect.top - 6))
-
-        bg = pygame.Surface(rect.size, pygame.SRCALPHA)
-        pygame.draw.rect(bg, (*fill, alpha), bg.get_rect(), border_radius=radius)
-        # Inner glow / Glass effect
-        pygame.draw.rect(bg, (*tuple(min(255, c + 40) for c in fill), 30), bg.get_rect(), border_radius=radius)
-        self.screen.blit(bg, rect)
-
-        highlight = pygame.Rect(rect.left + 4, rect.top + 3, rect.width - 8, max(5, rect.height // 3))
-        hi = pygame.Surface(highlight.size, pygame.SRCALPHA)
-        pygame.draw.rect(hi, (255, 255, 230, 25), hi.get_rect(), border_radius=max(2, radius - 2))
-        self.screen.blit(hi, highlight)
-
-        pygame.draw.line(self.screen, tuple(min(255, c + 45) for c in border), (rect.left + 8, rect.top + 2), (rect.right - 8, rect.top + 2), 1)
-        pygame.draw.line(self.screen, tuple(max(0, c - 50) for c in border), (rect.left + 8, rect.bottom - 2), (rect.right - 8, rect.bottom - 2), 2)
-        pygame.draw.rect(self.screen, border, rect, 1, border_radius=radius)
+        key = (
+            "panel",
+            rect.width,
+            rect.height,
+            depth,
+            radius,
+            alpha,
+            *fill,
+            *border,
+        )
+        panel = self._menu_surface_cache.get(key)
+        if panel is None:
+            panel = pygame.Surface((rect.width + 12, rect.height + depth + 12), pygame.SRCALPHA)
+            body = pygame.Rect(6, 6, rect.width, rect.height)
+            pygame.draw.rect(panel, (0, 0, 0, 120), pygame.Rect(6, depth + 6, rect.width, rect.height), border_radius=radius)
+            pygame.draw.rect(panel, (*fill, alpha), body, border_radius=radius)
+            pygame.draw.rect(panel, (*tuple(min(255, c + 40) for c in fill), 30), body, border_radius=radius)
+            highlight = pygame.Rect(10, 9, rect.width - 8, max(5, rect.height // 3))
+            pygame.draw.rect(panel, (255, 255, 230, 25), highlight, border_radius=max(2, radius - 2))
+            pygame.draw.line(panel, tuple(min(255, c + 45) for c in border), (14, 8), (rect.width - 2, 8), 1)
+            pygame.draw.line(panel, tuple(max(0, c - 50) for c in border), (14, rect.height + 4), (rect.width - 2, rect.height + 4), 2)
+            pygame.draw.rect(panel, border, body, 1, border_radius=radius)
+            self._menu_surface_cache[key] = panel
+        self.screen.blit(panel, (rect.left - 6, rect.top - 6))
 
     def _panel(self, rect: pygame.Rect) -> None:
         bg = pygame.Surface(rect.size, pygame.SRCALPHA)
@@ -3099,6 +3403,24 @@ class Game:
         pygame.draw.rect(self.screen, (91, 108, 83), rect, 2, border_radius=8)
 
     def _draw_map_preview(self, rect: pygame.Rect, data: dict, muted: bool = False) -> None:
+        cache_key = (id(data), rect.width, rect.height, muted)
+        cached = self._map_preview_cache.get(cache_key)
+        if cached is not None:
+            self.screen.blit(cached, rect)
+            return
+
+        preview = pygame.Surface(rect.size, pygame.SRCALPHA)
+        target = self.screen
+        self.screen = preview
+        local_rect = preview.get_rect()
+        try:
+            self._render_map_preview_uncached(local_rect, data, muted)
+        finally:
+            self.screen = target
+        self._map_preview_cache[cache_key] = preview
+        target.blit(preview, rect)
+
+    def _render_map_preview_uncached(self, rect: pygame.Rect, data: dict, muted: bool = False) -> None:
         rows = data["rows"]
         cols = len(rows[0])
         tile_w = rect.width / cols
@@ -3242,7 +3564,7 @@ class Game:
                 ("warning", f"{len(self.enemies)} INF / {len(self.enemy_vehicles)} ARM / {len(self.enemy_aircraft)} AIR"),
                 ("hp", f"{hp_label} {max(0, actor.hp)}"),
                 ("ammo", ammo_label),
-                ("objective", f"{weapon.name}  D{weapon.damage}  R{weapon.shots_per_second}/s"),
+                ("objective", f"AK-47 D{self.ak_damage()}  R{weapon.shots_per_second}/s"),
             ]
         )
         self._draw_mission_tracker()
@@ -3361,8 +3683,7 @@ class Game:
 
     def _draw_action_bar(self, mortar_status: str) -> None:
         slots = [
-            ("1", weapon_name(self.equipped_primary), self._shop_icon(self.equipped_primary), self.weapon_mode == self.equipped_primary, None),
-            ("2", weapon_name(self.equipped_sidearm), self._shop_icon(self.equipped_sidearm), self.weapon_mode == self.equipped_sidearm, None),
+            ("1", f"AK D{self.ak_damage()}", self._shop_icon("ak47"), True, None),
             ("Q", "Bash", self.assets.frame("prop", 90, 32), False, None),
             ("G", f"Gren x{self.inventory.grenades}", self._shop_icon("grenade"), False, self.inventory.grenades > 0),
             ("H", f"Med x{self.inventory.medkits}", self._shop_icon("medkit"), False, self.inventory.medkits > 0),
